@@ -185,7 +185,7 @@ fn analyze(host: &mut impl Host, config: &MainConfig, config_path: Option<&PathB
     let _ = writeln!(host.error());
     let excludes: Vec<PathBuf> = workspace_tree.files.distinct().into_iter().collect();
 
-    let unrelated = utils::find_unrelated(&git_root, &excludes, &config.file_exclude_patterns, &config.trip_wire_patterns);
+    let unrelated = utils::find_unrelated(&git_root, &excludes, &config.file_exclude_patterns, &config.tripwire_patterns);
 
     if !config.file_exclude_patterns.is_empty() {
         let _ = writeln!(
@@ -195,8 +195,8 @@ fn analyze(host: &mut impl Host, config: &MainConfig, config_path: Option<&PathB
         );
     }
 
-    if !config.trip_wire_patterns.is_empty() {
-        let _ = writeln!(host.error(), "Trip wire patterns      : {}", config.trip_wire_patterns.join(", "));
+    if !config.tripwire_patterns.is_empty() {
+        let _ = writeln!(host.error(), "Tripwire patterns       : {}", config.tripwire_patterns.join(", "));
     }
 
     if !unrelated.filtered.is_empty() {
@@ -207,10 +207,10 @@ fn analyze(host: &mut impl Host, config: &MainConfig, config_path: Option<&PathB
         }
     }
 
-    if !unrelated.trip_wire.is_empty() {
+    if !unrelated.tripwire.is_empty() {
         let _ = writeln!(host.error());
-        let _ = writeln!(host.error(), "Trip wire file(s): (changes to these trigger a full rebuild)");
-        for file in &unrelated.trip_wire {
+        let _ = writeln!(host.error(), "Tripwire file(s): (changes to these trigger a full rebuild)");
+        for file in &unrelated.tripwire {
             let _ = writeln!(host.error(), "  {}", file.display());
         }
     }
@@ -335,11 +335,11 @@ fn get_impacted_crates(
 ) -> Impact {
     let mut modified = HashSet::new();
 
-    if !config.trip_wire_patterns.is_empty() {
+    if !config.tripwire_patterns.is_empty() {
         use glob::Pattern;
 
-        let trip_wire_patterns: Vec<Pattern> = config
-            .trip_wire_patterns
+        let tripwire_patterns: Vec<Pattern> = config
+            .tripwire_patterns
             .iter()
             .filter_map(|pattern| Pattern::new(pattern).ok())
             .collect();
@@ -348,14 +348,14 @@ fn get_impacted_crates(
 
         for deleted_file in &git_diff.deleted {
             let file_str = deleted_file.to_string_lossy();
-            if trip_wire_patterns.iter().any(|pattern| pattern.matches(&file_str)) {
+            if tripwire_patterns.iter().any(|pattern| pattern.matches(&file_str)) {
                 tripped_files.push(file_str.to_string());
             }
         }
 
         for changed_file in &git_diff.changed {
             let file_str = changed_file.to_string_lossy();
-            if trip_wire_patterns.iter().any(|pattern| pattern.matches(&file_str)) {
+            if tripwire_patterns.iter().any(|pattern| pattern.matches(&file_str)) {
                 tripped_files.push(file_str.to_string());
             }
         }
@@ -363,7 +363,7 @@ fn get_impacted_crates(
         if !tripped_files.is_empty() {
             let _ = writeln!(
                 host.error(),
-                "WARNING: Trip wire activated due to changes in the following file(s):"
+                "WARNING: Tripwire activated due to changes in the following file(s):"
             );
             for file in &tripped_files {
                 let _ = writeln!(host.error(), "- {file}");
@@ -379,7 +379,7 @@ fn get_impacted_crates(
             };
         }
 
-        let _ = writeln!(host.error(), "Trip wire is enabled, but no matching files were found, good.");
+        let _ = writeln!(host.error(), "Tripwire is enabled, but no matching files were found, good.");
         let _ = writeln!(host.error());
     }
 
@@ -612,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn trip_wire_activated_returns_all_crates() {
+    fn tripwire_activated_returns_all_crates() {
         let mut host = TestHost::new();
         let tree = make_workspace(&[("app", &["app/src/main.rs"], &[]), ("lib", &["lib/src/lib.rs"], &[])]);
         let diff = GitDiff {
@@ -620,7 +620,7 @@ mod tests {
             deleted: vec![],
         };
         let config = MainConfig {
-            trip_wire_patterns: vec!["Cargo.lock".to_string()],
+            tripwire_patterns: vec!["Cargo.lock".to_string()],
             ..MainConfig::default()
         };
 
@@ -630,11 +630,11 @@ mod tests {
         assert!(result.modified.contains("lib"));
         assert!(result.affected.contains("app"));
         assert!(result.affected.contains("lib"));
-        assert!(host.stderr_str().contains("Trip wire activated"));
+        assert!(host.stderr_str().contains("Tripwire activated"));
     }
 
     #[test]
-    fn trip_wire_enabled_no_match() {
+    fn tripwire_enabled_no_match() {
         let mut host = TestHost::new();
         let tree = make_workspace(&[("lib", &["lib/src/lib.rs"], &[])]);
         let diff = GitDiff {
@@ -642,7 +642,7 @@ mod tests {
             deleted: vec![],
         };
         let config = MainConfig {
-            trip_wire_patterns: vec!["Cargo.lock".to_string()],
+            tripwire_patterns: vec!["Cargo.lock".to_string()],
             ..MainConfig::default()
         };
 
@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn trip_wire_on_deleted_file() {
+    fn tripwire_on_deleted_file() {
         let mut host = TestHost::new();
         let tree = make_workspace(&[("app", &["app/src/main.rs"], &[])]);
         let diff = GitDiff {
@@ -661,14 +661,14 @@ mod tests {
             deleted: vec![PathBuf::from("Cargo.lock")],
         };
         let config = MainConfig {
-            trip_wire_patterns: vec!["Cargo.lock".to_string()],
+            tripwire_patterns: vec!["Cargo.lock".to_string()],
             ..MainConfig::default()
         };
 
         let result = get_impacted_crates(&mut host, &tree, &tree, &diff, &config);
 
         assert!(result.modified.contains("app"));
-        assert!(host.stderr_str().contains("Trip wire activated"));
+        assert!(host.stderr_str().contains("Tripwire activated"));
     }
 
     // --- print_common_props tests ---

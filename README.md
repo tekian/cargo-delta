@@ -20,7 +20,7 @@
     - [File Method Matching](#file-method-matching)
 - [File Control](#file-control)
     - [File Exclusion](#file-exclusion)
-    - [Trip Wire](#trip-wire)
+    - [Tripwire](#tripwire)
 - [Output](#output)
     - [Analyze](#analyze)
     - [Run](#run)
@@ -200,21 +200,21 @@ Config default:
 file_exclude_patterns = ["target/**", "*.tmp"]
 ```
 
-### Trip Wire
+### Tripwire
 
-If any changed or deleted file matches a trip wire pattern, all crates are considered impacted.
+If any changed or deleted file matches a tripwire pattern, all crates are considered impacted.
 
 Config default:
 
 ```toml
-trip_wire_patterns = []
+tripwire_patterns = []
 ```
 
 
 Config example:
 
 ```toml
-trip_wire_patterns = [
+tripwire_patterns = [
     "Cargo.toml",       # top-level Cargo.toml
     "delta.toml"   # Delta config file
 ]
