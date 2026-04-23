@@ -105,14 +105,14 @@ enum OutputFormat {
     /// `Impact` JSON object containing only the selected tiers (default emits all three,
     /// backward compatible).
     Json,
-    /// One crate name per line — convenient for `xargs` or shell loops.
+    /// One crate name per line - convenient for `xargs` or shell loops.
     Names,
-    /// Space-separated `-p NAME` arguments — drop straight into a `cargo` invocation
+    /// Space-separated `-p NAME` arguments - drop straight into a `cargo` invocation
     /// via `$(cargo delta run ... -f cargo-args)`.
     CargoArgs,
 }
 
-/// Bitmask of which impact tiers to emit. `none()` means "all on" (default).
+/// Bit-mask of which impact tiers to emit. `none()` means "all on" (default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TierMask {
     modified: bool,
@@ -121,7 +121,7 @@ struct TierMask {
 }
 
 impl TierMask {
-    /// Resolve the user-provided flags into the effective mask (no flags ⇒ all on).
+    /// Resolve the user-provided flags into the effective mask (no flags equals all on).
     fn resolve(modified: bool, affected: bool, required: bool) -> Self {
         if !modified && !affected && !required {
             Self {
@@ -453,7 +453,7 @@ fn sorted(set: &HashSet<String>) -> Vec<String> {
 }
 
 /// Union of the selected tiers, deduplicated and sorted. For non-json formats this is what
-/// the user actually wants — listing both `--affected` and `--required` shouldn't print
+/// the user actually wants - listing both `--affected` and `--required` shouldn't print
 /// the same crate twice.
 #[doc(hidden)]
 fn union_of_tiers(result: &Impact, tiers: TierMask) -> Vec<String> {
@@ -852,14 +852,8 @@ mod tests {
         let impact = sample_impact();
         // Affected ⊇ Modified, Required ⊇ Affected — union with all three == required.
         assert_eq!(union_of_tiers(&impact, all_tiers()), vec!["a", "b", "c"]);
-        assert_eq!(
-            union_of_tiers(&impact, TierMask::resolve(true, false, false)),
-            vec!["a"]
-        );
-        assert_eq!(
-            union_of_tiers(&impact, TierMask::resolve(false, true, false)),
-            vec!["a", "b"]
-        );
+        assert_eq!(union_of_tiers(&impact, TierMask::resolve(true, false, false)), vec!["a"]);
+        assert_eq!(union_of_tiers(&impact, TierMask::resolve(false, true, false)), vec!["a", "b"]);
     }
 
     #[test]
