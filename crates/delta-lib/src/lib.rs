@@ -6,8 +6,9 @@
 
 use clap::builder::Styles;
 use clap::builder::styling::{AnsiColor, Effects};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -63,24 +64,83 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run delta and show impacted crates
-    Run(RunCommand),
-    /// Analyze current workspace and produce JSON output
-    Analyze(AnalyzeCommand),
+    /// Compute impacted crates from a pair of snapshots
+    #[command(alias = "run")]
+    Impact(ImpactCommand),
+    /// Snapshot the current workspace into a JSON artifact
+    #[command(alias = "analyze")]
+    Snapshot(SnapshotCommand),
 }
 
 #[derive(Parser)]
-struct RunCommand {
+struct ImpactCommand {
     /// Baseline workspace analysis JSON file (e.g., from main branch)
     #[arg(long, value_name = "PATH")]
     baseline: PathBuf,
     /// Current workspace analysis JSON file (e.g., from feature branch)
     #[arg(long, value_name = "PATH")]
     current: PathBuf,
+    /// Output format on stdout. Non-json formats emit the union of the selected tiers and
+    /// suppress the human-readable banner from stdout (it still goes to stderr), so the
+    /// output can be captured directly, e.g. `cargo build $(cargo delta run ... -f cargo-args)`.
+    #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::Json)]
+    format: OutputFormat,
+    /// Include crates directly modified by Git changes. If none of `--modified`,
+    /// `--affected`, `--required` are given, all three are included (default).
+    #[arg(long)]
+    modified: bool,
+    /// Include modified crates plus their transitive dependents. If none of `--modified`,
+    /// `--affected`, `--required` are given, all three are included (default).
+    #[arg(long)]
+    affected: bool,
+    /// Include affected crates plus their transitive dependencies. If none of `--modified`,
+    /// `--affected`, `--required` are given, all three are included (default).
+    #[arg(long)]
+    required: bool,
+}
+
+/// Output format for the `run` subcommand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    /// `Impact` JSON object containing only the selected tiers (default emits all three,
+    /// backward compatible).
+    Json,
+    /// One crate name per line — convenient for `xargs` or shell loops.
+    Names,
+    /// Space-separated `-p NAME` arguments — drop straight into a `cargo` invocation
+    /// via `$(cargo delta run ... -f cargo-args)`.
+    CargoArgs,
+}
+
+/// Bitmask of which impact tiers to emit. `none()` means "all on" (default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TierMask {
+    modified: bool,
+    affected: bool,
+    required: bool,
+}
+
+impl TierMask {
+    /// Resolve the user-provided flags into the effective mask (no flags ⇒ all on).
+    fn resolve(modified: bool, affected: bool, required: bool) -> Self {
+        if !modified && !affected && !required {
+            Self {
+                modified: true,
+                affected: true,
+                required: true,
+            }
+        } else {
+            Self {
+                modified,
+                affected,
+                required,
+            }
+        }
+    }
 }
 
 #[derive(Parser)]
-struct AnalyzeCommand;
+struct SnapshotCommand;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,9 +174,17 @@ pub fn run(host: &mut impl Host, args: impl IntoIterator<Item = String>) {
     };
 
     match &cli.command {
-        Commands::Run(run_cmd) => run_command(host, &config, &run_cmd.baseline, &run_cmd.current, cli.config.as_ref()),
+        Commands::Impact(cmd) => impact(
+            host,
+            &config,
+            &cmd.baseline,
+            &cmd.current,
+            cli.config.as_ref(),
+            cmd.format,
+            TierMask::resolve(cmd.modified, cmd.affected, cmd.required),
+        ),
 
-        Commands::Analyze(_) => analyze(host, &config, cli.config.as_ref()),
+        Commands::Snapshot(_) => snapshot(host, &config, cli.config.as_ref()),
     }
 }
 
@@ -129,9 +197,9 @@ fn print_common_props(host: &mut impl Host, config_path: Option<&PathBuf>) {
 }
 
 #[doc(hidden)]
-fn analyze(host: &mut impl Host, config: &MainConfig, config_path: Option<&PathBuf>) {
+fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&PathBuf>) {
     let start = Instant::now();
-    let _ = writeln!(host.error(), "Analyzing workspace..");
+    let _ = writeln!(host.error(), "Snapshotting workspace..");
     print_common_props(host, config_path);
 
     let metadata = match cargo::metadata(host) {
@@ -224,12 +292,20 @@ fn analyze(host: &mut impl Host, config: &MainConfig, config_path: Option<&PathB
     }
 
     let duration = start.elapsed();
-    let _ = writeln!(host.error(), "\nAnalysis finished in {duration:.2?}");
+    let _ = writeln!(host.error(), "\nSnapshot finished in {duration:.2?}");
 }
 
 #[doc(hidden)]
-fn run_command(host: &mut impl Host, config: &MainConfig, baseline: &Path, current: &Path, config_path: Option<&PathBuf>) {
-    let _ = writeln!(host.error(), "Running delta..\n");
+fn impact(
+    host: &mut impl Host,
+    config: &MainConfig,
+    baseline: &Path,
+    current: &Path,
+    config_path: Option<&PathBuf>,
+    format: OutputFormat,
+    tiers: TierMask,
+) {
+    let _ = writeln!(host.error(), "Computing impact..");
     print_common_props(host, config_path);
 
     // Get git root to ensure we're working with consistent path bases
@@ -292,15 +368,8 @@ fn run_command(host: &mut impl Host, config: &MainConfig, baseline: &Path, curre
 
     let result = get_impacted_crates(host, &baseline_tree, &current_tree, &diff, config);
 
-    match serde_json::to_string_pretty(&result) {
-        Ok(json_output) => {
-            let _ = writeln!(host.output(), "{json_output}");
-        }
-        Err(e) => {
-            let _ = writeln!(host.error(), "Error serializing result to JSON: {e}");
-            host.exit(1);
-            return;
-        }
+    if !emit_result(host, &result, format, tiers) {
+        return;
     }
 
     let total_crates = current_tree.crates.len();
@@ -323,6 +392,84 @@ fn run_command(host: &mut impl Host, config: &MainConfig, baseline: &Path, curre
     );
     let _ = writeln!(host.error(), "Total       {total_crates:>3} (Total crates in this workspace.)");
     let _ = writeln!(host.error());
+}
+
+#[doc(hidden)]
+fn emit_result(host: &mut impl Host, result: &Impact, format: OutputFormat, tiers: TierMask) -> bool {
+    match format {
+        OutputFormat::Json => {
+            let mut obj = serde_json::Map::new();
+            if tiers.modified {
+                let _ = obj.insert("Modified".to_string(), json!(sorted(&result.modified)));
+            }
+            if tiers.affected {
+                let _ = obj.insert("Affected".to_string(), json!(sorted(&result.affected)));
+            }
+            if tiers.required {
+                let _ = obj.insert("Required".to_string(), json!(sorted(&result.required)));
+            }
+            match serde_json::to_string_pretty(&serde_json::Value::Object(obj)) {
+                Ok(json_output) => {
+                    let _ = writeln!(host.output(), "{json_output}");
+                    true
+                }
+                Err(e) => {
+                    let _ = writeln!(host.error(), "Error serializing result to JSON: {e}");
+                    host.exit(1);
+                    false
+                }
+            }
+        }
+        OutputFormat::Names => {
+            let mut out = host.output();
+            for name in union_of_tiers(result, tiers) {
+                let _ = writeln!(out, "{name}");
+            }
+            true
+        }
+        OutputFormat::CargoArgs => {
+            let joined = union_of_tiers(result, tiers)
+                .iter()
+                .map(|n| format!("-p {n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            // Empty tier ⇒ emit nothing at all (not even a newline). Otherwise
+            // `echo "Impacted: $(...)"` would print a stray trailing space, and
+            // `cargo build $(...)` callers can't easily tell "no crates" from
+            // "blank line". `[ -z "$VAR" ]` then works as expected.
+            if !joined.is_empty() {
+                let _ = writeln!(host.output(), "{joined}");
+            }
+            true
+        }
+    }
+}
+
+#[doc(hidden)]
+fn sorted(set: &HashSet<String>) -> Vec<String> {
+    let mut names: Vec<String> = set.iter().cloned().collect();
+    names.sort();
+    names
+}
+
+/// Union of the selected tiers, deduplicated and sorted. For non-json formats this is what
+/// the user actually wants — listing both `--affected` and `--required` shouldn't print
+/// the same crate twice.
+#[doc(hidden)]
+fn union_of_tiers(result: &Impact, tiers: TierMask) -> Vec<String> {
+    let mut union: HashSet<&String> = HashSet::new();
+    if tiers.modified {
+        union.extend(result.modified.iter());
+    }
+    if tiers.affected {
+        union.extend(result.affected.iter());
+    }
+    if tiers.required {
+        union.extend(result.required.iter());
+    }
+    let mut names: Vec<String> = union.into_iter().cloned().collect();
+    names.sort();
+    names
 }
 
 #[doc(hidden)]
@@ -671,6 +818,118 @@ mod tests {
         assert!(host.stderr_str().contains("Trip wire activated"));
     }
 
+    // --- emit_result / TierMask tests ---
+
+    fn sample_impact() -> Impact {
+        Impact {
+            modified: ["a"].into_iter().map(String::from).collect(),
+            affected: ["a", "b"].into_iter().map(String::from).collect(),
+            required: ["a", "b", "c"].into_iter().map(String::from).collect(),
+        }
+    }
+
+    fn all_tiers() -> TierMask {
+        TierMask::resolve(false, false, false)
+    }
+
+    #[test]
+    fn tier_mask_resolve_no_flags_enables_all() {
+        let m = TierMask::resolve(false, false, false);
+        assert!(m.modified && m.affected && m.required);
+    }
+
+    #[test]
+    fn tier_mask_resolve_any_flag_acts_as_filter() {
+        let m = TierMask::resolve(true, false, false);
+        assert!(m.modified && !m.affected && !m.required);
+
+        let m = TierMask::resolve(false, true, true);
+        assert!(!m.modified && m.affected && m.required);
+    }
+
+    #[test]
+    fn union_of_tiers_dedupes_and_sorts() {
+        let impact = sample_impact();
+        // Affected ⊇ Modified, Required ⊇ Affected — union with all three == required.
+        assert_eq!(union_of_tiers(&impact, all_tiers()), vec!["a", "b", "c"]);
+        assert_eq!(
+            union_of_tiers(&impact, TierMask::resolve(true, false, false)),
+            vec!["a"]
+        );
+        assert_eq!(
+            union_of_tiers(&impact, TierMask::resolve(false, true, false)),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn emit_result_json_default_emits_all_three_keys_sorted() {
+        let mut host = TestHost::new();
+        let ok = emit_result(&mut host, &sample_impact(), OutputFormat::Json, all_tiers());
+        assert!(ok);
+        let stdout = host.stdout_str();
+        assert!(stdout.contains("\"Modified\""));
+        assert!(stdout.contains("\"Affected\""));
+        assert!(stdout.contains("\"Required\""));
+        // Values should now be sorted arrays, not unordered HashSet dumps.
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(parsed["Required"], serde_json::json!(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn emit_result_json_filter_omits_unselected_keys() {
+        let mut host = TestHost::new();
+        let ok = emit_result(
+            &mut host,
+            &sample_impact(),
+            OutputFormat::Json,
+            TierMask::resolve(false, true, false),
+        );
+        assert!(ok);
+        let parsed: serde_json::Value = serde_json::from_str(&host.stdout_str()).unwrap();
+        assert!(parsed.get("Modified").is_none());
+        assert!(parsed.get("Required").is_none());
+        assert_eq!(parsed["Affected"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn emit_result_names_emits_union_one_per_line() {
+        let mut host = TestHost::new();
+        let ok = emit_result(
+            &mut host,
+            &sample_impact(),
+            OutputFormat::Names,
+            TierMask::resolve(true, true, false),
+        );
+        assert!(ok);
+        // Modified ∪ Affected = {a, b}
+        assert_eq!(host.stdout_str(), "a\nb\n");
+    }
+
+    #[test]
+    fn emit_result_cargo_args_emits_dash_p_pairs_for_union() {
+        let mut host = TestHost::new();
+        let ok = emit_result(&mut host, &sample_impact(), OutputFormat::CargoArgs, all_tiers());
+        assert!(ok);
+        // Union of all tiers == required == {a, b, c}
+        assert_eq!(host.stdout_str(), "-p a -p b -p c\n");
+    }
+
+    #[test]
+    fn emit_result_cargo_args_empty_tier_emits_blank_line() {
+        let mut host = TestHost::new();
+        let empty = Impact {
+            modified: HashSet::new(),
+            affected: HashSet::new(),
+            required: HashSet::new(),
+        };
+        let ok = emit_result(&mut host, &empty, OutputFormat::CargoArgs, all_tiers());
+        assert!(ok);
+        // Empty set ⇒ truly empty output (no trailing newline) so shell
+        // callers can use `[ -z "$VAR" ]` to detect "nothing impacted".
+        assert_eq!(host.stdout_str(), "");
+    }
+
     // --- print_common_props tests ---
 
     #[test]
@@ -709,10 +968,22 @@ mod tests {
     fn run_analyze_cargo_metadata_failure_exits() {
         let mut host = TestHost::new().with_commands(vec![Ok(failure_output("error: could not find Cargo.toml"))]);
 
+        // Uses the legacy "analyze" alias to guard against accidental alias removal.
         run(&mut host, ["cargo", "delta", "analyze"].iter().map(ToString::to_string));
 
         assert_eq!(host.exit_code, Some(1));
         assert!(host.stderr_str().contains("Error getting cargo metadata"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn snapshot_subcommand_canonical_name_works() {
+        let mut host = TestHost::new().with_commands(vec![Ok(failure_output("error: could not find Cargo.toml"))]);
+
+        run(&mut host, ["cargo", "delta", "snapshot"].iter().map(ToString::to_string));
+
+        assert_eq!(host.exit_code, Some(1));
+        assert!(host.stderr_str().contains("Snapshotting workspace"));
     }
 
     #[test]
@@ -725,6 +996,7 @@ mod tests {
             Ok(success_output("")),                         // git diff (no changes)
         ]);
 
+        // Uses the legacy "run" alias to guard against accidental alias removal.
         run(
             &mut host,
             ["cargo", "delta", "run", "--baseline", "fake.json", "--current", "fake.json"]
@@ -734,6 +1006,27 @@ mod tests {
 
         assert_eq!(host.exit_code, Some(0));
         assert!(host.stderr_str().contains("No file has been changed"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn impact_subcommand_canonical_name_works() {
+        let mut host = TestHost::new().with_commands(vec![
+            Ok(success_output("/fake/root\n")),
+            Ok(success_output("abc\trefs/heads/master\n")),
+            Ok(success_output("abc123\n")),
+            Ok(success_output("")),
+        ]);
+
+        run(
+            &mut host,
+            ["cargo", "delta", "impact", "--baseline", "fake.json", "--current", "fake.json"]
+                .iter()
+                .map(ToString::to_string),
+        );
+
+        assert_eq!(host.exit_code, Some(0));
+        assert!(host.stderr_str().contains("Computing impact"));
     }
 
     #[test]
