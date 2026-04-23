@@ -4,6 +4,7 @@ description = "Deprecated: use cargo-delta instead."
 keywords = ["cargo", "workspace", "ci", "build", "git"]
 categories = ["development-tools", "development-tools::cargo-plugins"]
 readme = "../../README.md"
+publish = false
 
 authors.workspace = true
 version = "0.2.0"
