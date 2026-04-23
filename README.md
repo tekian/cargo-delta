@@ -22,8 +22,8 @@
     - [File Exclusion](#file-exclusion)
     - [Trip Wire](#trip-wire)
 - [Output](#output)
-    - [Analyze](#analyze)
-    - [Run](#run)
+    - [Snapshot](#snapshot)
+    - [Impact](#impact)
 - [Limitations](#limitations)
 - [Example](#example)
 - [Contributing](#contributing)
@@ -39,43 +39,90 @@ cargo install cargo-delta
 
 ### Quick Start
 
-1. **Analyze the baseline branch:**
+1. **Snapshot the baseline branch:**
    ```bash
    git checkout main
-   cargo delta analyze > main.json
+   cargo delta snapshot > main.json
    ```
 
-2. **Analyze the feature branch:**
+2. **Snapshot the feature branch:**
    ```bash
    git checkout feature-branch
-   cargo delta analyze > feature.json
+   cargo delta snapshot > feature.json
    ```
 
-3. **Compare to find impacted crates:**
+3. **Compute the impact:**
    ```bash
-   cargo delta run --baseline main.json --current feature.json
+   cargo delta impact --baseline main.json --current feature.json
    ```
+
+   By default this prints the full `Impact` JSON with all three tiers. Use the
+   tier toggles (`--modified`, `--affected`, `--required`) to filter — when none
+   are given, all three are included (back-compat). To plug the result straight
+   into `cargo`, change the format:
+
+   ```bash
+   # One crate per line — good for xargs / shell loops.
+   cargo delta impact --baseline main.json --current feature.json -f names --affected
+
+   # `-p NAME` pairs — drop into any cargo invocation via $(...).
+   cargo build $(cargo delta impact --baseline main.json --current feature.json -f cargo-args --affected)
+
+   # JSON, but only the keys you care about:
+   cargo delta impact --baseline main.json --current feature.json --required
+   ```
+
+   Combining tier toggles for `names` / `cargo-args` emits the **union** of the
+   selected tiers (deduplicated, sorted). The human-readable summary is written
+   to stderr, so `$(...)` capture stays clean.
+
+   > The legacy subcommand names `analyze` (= `snapshot`) and `run` (= `impact`)
+   > continue to work as hidden aliases for back-compat.
 
 ### CI/CD Integration
 
 `cargo-delta` is designed to speed up PR builds by building and testing only impacted crates.
 Since detection is best-effort, a **backstop build** must run separately to catch anything delta missed or was misconfigured for.
 
-**PR pipeline** — runs delta, builds and tests only impacted crates:
+**PR pipeline** — snapshot both branches, then capture each tier into its own
+variable. Different cargo commands need different tiers:
+
+| Command | Tier | Reasoning |
+|---|---|---|
+| `cargo fmt --check`, `cargo clippy` | `--modified` | Lints and formatting only matter for code the PR actually touched. Untouched code already passed on `main`. |
+| `cargo build`, `cargo test`, `cargo bench` | `--affected` | A modified crate can break a dependent's compile or behavior, so downstream needs to be built and tested too. |
+| `cargo doc`, vendor verification | `--required` | Needs transitive dependencies in scope. |
 
 ```yaml
-# 1. Analyze baseline (main branch)
-- run: git checkout origin/main && cargo delta analyze > baseline.json
+- name: Snapshot baseline (main)
+  run: git checkout origin/main && cargo delta snapshot > baseline.json
 
-# 2. Analyze current (PR branch)
-- run: git checkout $PR_BRANCH && cargo delta analyze > current.json
+- name: Snapshot current (PR)
+  run: git checkout $PR_BRANCH && cargo delta snapshot > current.json
 
-# 3. Determine impacted crates
-- run: cargo delta run --baseline baseline.json --current current.json > delta.json
+- name: Build, test, lint impacted crates
+  run: |
+    MODIFIED=$(cargo delta impact --baseline baseline.json --current current.json -f cargo-args --modified)
+    AFFECTED=$(cargo delta impact --baseline baseline.json --current current.json -f cargo-args --affected)
+    echo "Modified: $MODIFIED"
+    echo "Affected: $AFFECTED"
 
-# 4. Build/test only impacted crates (use "Required" output)
-- run: cargo test -p impacted-crate-a -p impacted-crate-b
+    # Lint only what changed.
+    cargo fmt --check $MODIFIED
+    cargo clippy $MODIFIED -- -D warnings
+
+    # Build & test what could be impacted by the change.
+    cargo build $AFFECTED
+    cargo test  $AFFECTED
 ```
+
+Notes:
+- The variables are **unquoted** on purpose — that's what lets the shell split
+  `-p foo -p bar` into separate cargo arguments.
+- If a tier ends up empty, the corresponding cargo command falls back to its
+  workspace default. Add `[ -z "$AFFECTED" ] && exit 0` if you'd rather skip.
+- The two `cargo delta impact` calls are cheap — they re-read the same snapshots
+  and do the same set computation; no need to deduplicate.
 
 **Backstop pipeline** — full build without delta, runs post-merge and/or on a nightly schedule:
 
@@ -93,8 +140,8 @@ it indicates a gap in detection or a misconfigured delta — adjust the [configu
 You can customize `cargo-delta` by providing a `-c config.toml` argument to the command.
 
 ```bash
-cargo delta analyze -c config.toml # ...
-cargo delta run -c config.toml # ...
+cargo delta snapshot -c config.toml # ...
+cargo delta impact -c config.toml # ...
 ```
 
 Configuration options can be set globally and overridden per crate. For example:
@@ -222,18 +269,20 @@ trip_wire_patterns = [
 
 ## Output
 
-### Analyze
+### Snapshot
 
-Analyze phase produces JSON file that's intended to be consumed by `run` phase.
+`cargo delta snapshot` writes a JSON artifact describing the workspace at the
+current checkout. It's the input to `cargo delta impact`.
 
 - **files**: Nested tree of file dependencies as detected by all the heuristics.
 - **crates**: Dependency relationships between crates within the workspace.
 
-### Run
+### Impact
 
-Run phase produces JSON file that's intended to be consumed by _your_ CI/CD.
+`cargo delta impact` compares two snapshots plus the git diff and prints which
+crates are impacted, in a JSON shape your CI/CD can consume.
 
-- **Modified**: Crates directly modified by Git changes. 
+- **Modified**: Crates directly modified by Git changes.
 - **Affected**: Modified crates plus all their dependents, direct and indirect.
 - **Required**: Affected crates plus all their dependencies, direct and indirect.
 
@@ -250,9 +299,8 @@ This tool is **best-effort** and may not detect all dependencies:
 ## Example
 
 ```bash
-$ cargo delta run --baseline main.json --current feature.json
-Running delta..
-
+$ cargo delta impact --baseline main.json --current feature.json
+Computing impact..
 Looking up git changes..
 
 Changed file: "src/api/mod.rs"
@@ -273,7 +321,7 @@ Using current analysis  : feature.json
   ],
   "Required": [
     "my-api",
-    "my-utils", 
+    "my-utils",
     "my-app",
     "common-lib"
   ]
