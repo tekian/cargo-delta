@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-04-23
+
+### Added
+
+- Add `--format / -f {json|names|cargo-args}` flag to the impact subcommand (#24)
+- Add tier-toggle flags `--modified`, `--affected`, `--required` (#24)
+
+### Changed
+
+- Rename subcommands `analyze` → `snapshot` and `run` → `impact`; legacy names kept as hidden aliases (#24)
+- Sort impact JSON arrays for deterministic output (#24)
+- `-f cargo-args` on an empty tier emits no output (no trailing newline) (#24)
+
+### Fixed
+
+- Minor banner wording and spacing polish (#24)
+
 ## [0.2.1] - 2026-02-25
 
 ### Added
@@ -31,4 +48,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bump taiki-e/upload-rust-binary-action from 1.27.0 to 1.28.0 (#6)
 
-[0.2.1]: https://github.com/tekian/cargo-delta/compare/0.1...HEAD
+[0.3.0]: https://github.com/tekian/cargo-delta/compare/0.2.1...0.3.0
+[0.2.1]: https://github.com/tekian/cargo-delta/compare/0.1...0.2.1
