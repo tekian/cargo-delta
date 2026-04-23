@@ -122,7 +122,7 @@ struct TierMask {
 
 impl TierMask {
     /// Resolve the user-provided flags into the effective mask (no flags equals all on).
-    fn resolve(modified: bool, affected: bool, required: bool) -> Self {
+    const fn resolve(modified: bool, affected: bool, required: bool) -> Self {
         if !modified && !affected && !required {
             Self {
                 modified: true,
@@ -822,7 +822,7 @@ mod tests {
 
     fn sample_impact() -> Impact {
         Impact {
-            modified: ["a"].into_iter().map(String::from).collect(),
+            modified: core::iter::once("a").map(String::from).collect(),
             affected: ["a", "b"].into_iter().map(String::from).collect(),
             required: ["a", "b", "c"].into_iter().map(String::from).collect(),
         }
