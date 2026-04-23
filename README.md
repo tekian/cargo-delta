@@ -68,6 +68,12 @@ cargo install cargo-delta
    # `-p NAME` pairs — drop into any cargo invocation via $(...).
    cargo build $(cargo delta impact --baseline main.json --current feature.json -f cargo-args --affected)
 
+   # `--exclude NAME` for the workspace complement of the selected tier — combine
+   # with `cargo --workspace` to scope without `-p` ambiguity (since `--exclude`
+   # only matches workspace members, it can't collide with same-named registry
+   # deps). Empty when the selected tier covers the workspace.
+   cargo build --workspace $(cargo delta impact --baseline main.json --current feature.json -f cargo-excludes --affected)
+
    # JSON, but only the keys you care about:
    cargo delta impact --baseline main.json --current feature.json --required
    ```
