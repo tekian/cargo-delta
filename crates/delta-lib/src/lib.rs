@@ -405,13 +405,7 @@ fn impact(
 }
 
 #[doc(hidden)]
-fn emit_result(
-    host: &mut impl Host,
-    result: &Impact,
-    workspace: &[String],
-    format: OutputFormat,
-    tiers: TierMask,
-) -> bool {
+fn emit_result(host: &mut impl Host, result: &Impact, workspace: &[String], format: OutputFormat, tiers: TierMask) -> bool {
     match format {
         OutputFormat::Json => {
             let mut obj = serde_json::Map::new();
@@ -941,7 +935,13 @@ mod tests {
     #[test]
     fn emit_result_cargo_args_emits_dash_p_pairs_for_union() {
         let mut host = TestHost::new();
-        let ok = emit_result(&mut host, &sample_impact(), &sample_workspace(), OutputFormat::CargoArgs, all_tiers());
+        let ok = emit_result(
+            &mut host,
+            &sample_impact(),
+            &sample_workspace(),
+            OutputFormat::CargoArgs,
+            all_tiers(),
+        );
         assert!(ok);
         // Union of all tiers == required == {a, b, c}
         assert_eq!(host.stdout_str(), "-p a -p b -p c\n");
@@ -965,7 +965,13 @@ mod tests {
     #[test]
     fn emit_result_cargo_excludes_emits_complement_of_union() {
         let mut host = TestHost::new();
-        let ok = emit_result(&mut host, &sample_impact(), &sample_workspace(), OutputFormat::CargoExcludes, all_tiers());
+        let ok = emit_result(
+            &mut host,
+            &sample_impact(),
+            &sample_workspace(),
+            OutputFormat::CargoExcludes,
+            all_tiers(),
+        );
         assert!(ok);
         // Union (all tiers) = {a, b, c}; workspace = {a..e}; complement = {d, e}.
         assert_eq!(host.stdout_str(), "--exclude d --exclude e\n");
