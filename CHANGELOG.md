@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-04-24
+
+### Added
+
+- Add `-f cargo-excludes` output format that emits `--exclude NAME` arguments for the workspace complement of the selected tier(s). Combined with `cargo --workspace`, this scopes invocations without `-p` ambiguity (since `--exclude` only matches workspace members, it cannot collide with same-named transitive registry deps).
+
 ## [0.3.0] - 2026-04-23
 
 ### Added

@@ -110,6 +110,13 @@ enum OutputFormat {
     /// Space-separated `-p NAME` arguments - drop straight into a `cargo` invocation
     /// via `$(cargo delta run ... -f cargo-args)`.
     CargoArgs,
+    /// Space-separated `--exclude NAME` arguments for the *complement* of the selected
+    /// tier(s) within the workspace. Use with `cargo --workspace` to scope to impacted
+    /// crates without `-p` ambiguity (since `--exclude` matches workspace members only,
+    /// it can't collide with same-named transitive registry deps). Empty when the
+    /// selected tier covers (or exceeds) the workspace; combine with `-f names` for
+    /// a "nothing impacted" check.
+    CargoExcludes,
 }
 
 /// Bit-mask of which impact tiers to emit. `none()` means "all on" (default).
@@ -368,7 +375,10 @@ fn impact(
 
     let result = get_impacted_crates(host, &baseline_tree, &current_tree, &diff, config);
 
-    if !emit_result(host, &result, format, tiers) {
+    let mut workspace_names: Vec<String> = current_tree.crates.get_all_crate_names();
+    workspace_names.sort();
+
+    if !emit_result(host, &result, &workspace_names, format, tiers) {
         return;
     }
 
@@ -395,7 +405,7 @@ fn impact(
 }
 
 #[doc(hidden)]
-fn emit_result(host: &mut impl Host, result: &Impact, format: OutputFormat, tiers: TierMask) -> bool {
+fn emit_result(host: &mut impl Host, result: &Impact, workspace: &[String], format: OutputFormat, tiers: TierMask) -> bool {
     match format {
         OutputFormat::Json => {
             let mut obj = serde_json::Map::new();
@@ -437,6 +447,21 @@ fn emit_result(host: &mut impl Host, result: &Impact, format: OutputFormat, tier
             // `echo "Impacted: $(...)"` would print a stray trailing space, and
             // `cargo build $(...)` callers can't easily tell "no crates" from
             // "blank line". `[ -z "$VAR" ]` then works as expected.
+            if !joined.is_empty() {
+                let _ = writeln!(host.output(), "{joined}");
+            }
+            true
+        }
+        OutputFormat::CargoExcludes => {
+            let selected: HashSet<String> = union_of_tiers(result, tiers).into_iter().collect();
+            let joined = workspace
+                .iter()
+                .filter(|n| !selected.contains(*n))
+                .map(|n| format!("--exclude {n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            // Empty ⇒ selected covers the workspace (or exceeds it); the caller's
+            // `cargo --workspace` already does the right thing with no exclusions.
             if !joined.is_empty() {
                 let _ = writeln!(host.output(), "{joined}");
             }
@@ -828,6 +853,11 @@ mod tests {
         }
     }
 
+    fn sample_workspace() -> Vec<String> {
+        // A workspace of 5 crates; impact above touches a/b/c, leaves d/e untouched.
+        ["a", "b", "c", "d", "e"].into_iter().map(String::from).collect()
+    }
+
     fn all_tiers() -> TierMask {
         TierMask::resolve(false, false, false)
     }
@@ -859,7 +889,7 @@ mod tests {
     #[test]
     fn emit_result_json_default_emits_all_three_keys_sorted() {
         let mut host = TestHost::new();
-        let ok = emit_result(&mut host, &sample_impact(), OutputFormat::Json, all_tiers());
+        let ok = emit_result(&mut host, &sample_impact(), &sample_workspace(), OutputFormat::Json, all_tiers());
         assert!(ok);
         let stdout = host.stdout_str();
         assert!(stdout.contains("\"Modified\""));
@@ -876,6 +906,7 @@ mod tests {
         let ok = emit_result(
             &mut host,
             &sample_impact(),
+            &sample_workspace(),
             OutputFormat::Json,
             TierMask::resolve(false, true, false),
         );
@@ -892,6 +923,7 @@ mod tests {
         let ok = emit_result(
             &mut host,
             &sample_impact(),
+            &sample_workspace(),
             OutputFormat::Names,
             TierMask::resolve(true, true, false),
         );
@@ -903,7 +935,13 @@ mod tests {
     #[test]
     fn emit_result_cargo_args_emits_dash_p_pairs_for_union() {
         let mut host = TestHost::new();
-        let ok = emit_result(&mut host, &sample_impact(), OutputFormat::CargoArgs, all_tiers());
+        let ok = emit_result(
+            &mut host,
+            &sample_impact(),
+            &sample_workspace(),
+            OutputFormat::CargoArgs,
+            all_tiers(),
+        );
         assert!(ok);
         // Union of all tiers == required == {a, b, c}
         assert_eq!(host.stdout_str(), "-p a -p b -p c\n");
@@ -917,11 +955,70 @@ mod tests {
             affected: HashSet::new(),
             required: HashSet::new(),
         };
-        let ok = emit_result(&mut host, &empty, OutputFormat::CargoArgs, all_tiers());
+        let ok = emit_result(&mut host, &empty, &sample_workspace(), OutputFormat::CargoArgs, all_tiers());
         assert!(ok);
         // Empty set ⇒ truly empty output (no trailing newline) so shell
         // callers can use `[ -z "$VAR" ]` to detect "nothing impacted".
         assert_eq!(host.stdout_str(), "");
+    }
+
+    #[test]
+    fn emit_result_cargo_excludes_emits_complement_of_union() {
+        let mut host = TestHost::new();
+        let ok = emit_result(
+            &mut host,
+            &sample_impact(),
+            &sample_workspace(),
+            OutputFormat::CargoExcludes,
+            all_tiers(),
+        );
+        assert!(ok);
+        // Union (all tiers) = {a, b, c}; workspace = {a..e}; complement = {d, e}.
+        assert_eq!(host.stdout_str(), "--exclude d --exclude e\n");
+    }
+
+    #[test]
+    fn emit_result_cargo_excludes_filtered_tier_emits_wider_complement() {
+        let mut host = TestHost::new();
+        // Only --modified selected: union = {a}; complement = {b, c, d, e}.
+        let ok = emit_result(
+            &mut host,
+            &sample_impact(),
+            &sample_workspace(),
+            OutputFormat::CargoExcludes,
+            TierMask::resolve(true, false, false),
+        );
+        assert!(ok);
+        assert_eq!(host.stdout_str(), "--exclude b --exclude c --exclude d --exclude e\n");
+    }
+
+    #[test]
+    fn emit_result_cargo_excludes_full_workspace_selection_emits_nothing() {
+        let mut host = TestHost::new();
+        // Selection covers the whole workspace (e.g. trip wire fired) → no excludes.
+        let full = Impact {
+            modified: sample_workspace().into_iter().collect(),
+            affected: sample_workspace().into_iter().collect(),
+            required: sample_workspace().into_iter().collect(),
+        };
+        let ok = emit_result(&mut host, &full, &sample_workspace(), OutputFormat::CargoExcludes, all_tiers());
+        assert!(ok);
+        assert_eq!(host.stdout_str(), "");
+    }
+
+    #[test]
+    fn emit_result_cargo_excludes_empty_selection_excludes_entire_workspace() {
+        let mut host = TestHost::new();
+        // Nothing impacted ⇒ excludes the whole workspace. Callers should detect this
+        // via a separate `-f names` check and skip the cargo invocation entirely.
+        let empty = Impact {
+            modified: HashSet::new(),
+            affected: HashSet::new(),
+            required: HashSet::new(),
+        };
+        let ok = emit_result(&mut host, &empty, &sample_workspace(), OutputFormat::CargoExcludes, all_tiers());
+        assert!(ok);
+        assert_eq!(host.stdout_str(), "--exclude a --exclude b --exclude c --exclude d --exclude e\n");
     }
 
     // --- print_common_props tests ---
