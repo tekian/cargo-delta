@@ -4,9 +4,9 @@
 # Patterns for files and folders to exclude from analysis.
 file_exclude_patterns = [".*", "target"]
 
-# Trip wire patterns - if any changed file matches these patterns,
+# Tripwire patterns - if any changed file matches these patterns,
 # all crates in the workspace are going to be considered impacted.
-trip_wire_patterns = []
+tripwire_patterns = []
 
 [parser]
 # Enable/disable file reference detection from method calls.
