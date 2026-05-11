@@ -15,7 +15,7 @@ pub struct MainConfig {
     #[serde(default = "default_file_excludes")]
     pub file_exclude_patterns: Vec<String>,
     #[serde(default)]
-    pub trip_wire_patterns: Vec<String>,
+    pub tripwire_patterns: Vec<String>,
     #[serde(flatten)]
     pub crate_configs: HashMap<String, ParserConfig>,
 }
@@ -131,7 +131,7 @@ mod tests {
         let config = MainConfig::default();
         assert!(config.file_exclude_patterns.contains(&".*".to_string()));
         assert!(config.file_exclude_patterns.contains(&"target".to_string()));
-        assert!(config.trip_wire_patterns.is_empty());
+        assert!(config.tripwire_patterns.is_empty());
         assert!(config.git.is_none());
     }
 
@@ -160,7 +160,7 @@ mod tests {
     fn parse_toml_with_custom_values() {
         let toml_str = r#"
 file_exclude_patterns = ["build"]
-trip_wire_patterns = ["Cargo.lock"]
+tripwire_patterns = ["Cargo.lock"]
 
 [parser]
 file_refs = false
@@ -168,7 +168,7 @@ mods = false
 "#;
         let config: MainConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.file_exclude_patterns, vec!["build"]);
-        assert_eq!(config.trip_wire_patterns, vec!["Cargo.lock"]);
+        assert_eq!(config.tripwire_patterns, vec!["Cargo.lock"]);
         assert!(!config.parser.file_refs);
         assert!(!config.parser.mods);
         assert!(config.parser.includes);
