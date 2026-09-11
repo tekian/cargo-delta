@@ -39,6 +39,43 @@ cargo install cargo-delta
 
 ### Quick Start
 
+The high-level mode resolves both commits locally, snapshots them without
+changing your checkout, and writes the complete artifact set:
+
+```bash
+cargo delta impact \
+  --base-ref origin/main \
+  --output-dir target/cargo-delta
+```
+
+The output directory contains `impact.json`, one package file for each impact
+tier, both snapshots, and `manifest.json`. Package files contain sorted
+`name@version` specs and are zero bytes when their tier is empty. The manifest
+is published last and includes hashes for concurrent-reader validation.
+
+The workspace must be clean by default. To conservatively continue from a
+dirty checkout, widen every tier to the full current workspace:
+
+```bash
+cargo delta impact \
+  --base-ref origin/main \
+  --output-dir target/cargo-delta \
+  --dirty workspace
+```
+
+The command never fetches, so `origin/main` (or another requested ref) and its
+merge-base history must already exist locally.
+
+`--output-dir` is normalized relative to the invocation directory. When it is
+inside the repository, cargo-delta excludes only that exact subtree from dirty
+checking, so repeated runs work even when the directory is not ignored. The
+directory must not be the repository root, Git metadata, a symlinked path, or
+overlap tracked content; unrelated untracked files still follow the selected
+dirty policy.
+
+The low-level snapshot workflow remains available when snapshots or changed
+paths are managed externally:
+
 1. **Snapshot the baseline branch:**
    ```bash
    git checkout main
@@ -327,6 +364,12 @@ Use `--base-ref REF` for an explicit merge-base comparison, or
 `--changed-files PATH` to supply `{"changed":[],"deleted":[]}` paths directly.
 Use `--output PATH` to atomically write any format. The additive `packages`
 format emits one canonical `name@version` spec per line.
+
+Alternatively, pair `--base-ref REF` with `--output-dir DIR` and omit
+`--baseline`/`--current` to generate both exact-commit snapshots, all tier
+package files, `impact.json`, and a hash-bearing `manifest.json` in one
+invocation. Snapshot cache hits still revalidate the ref, merge base, changes,
+and dirty workspace state.
 
 
 ## Limitations

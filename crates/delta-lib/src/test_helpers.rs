@@ -16,6 +16,7 @@ pub struct TestHost {
     pub stderr: Vec<u8>,
     pub exit_code: Option<i32>,
     pub command_calls: Vec<CommandCall>,
+    current_dir: std::path::PathBuf,
     command_responses: VecDeque<io::Result<Output>>,
 }
 
@@ -26,6 +27,7 @@ impl TestHost {
             stderr: Vec::new(),
             exit_code: None,
             command_calls: Vec::new(),
+            current_dir: std::env::current_dir().expect("tests require a current working directory"),
             command_responses: VecDeque::new(),
         }
     }
@@ -55,6 +57,10 @@ impl Host for TestHost {
 
     fn exit(&mut self, code: i32) {
         self.exit_code = Some(code);
+    }
+
+    fn current_dir(&self) -> io::Result<std::path::PathBuf> {
+        Ok(self.current_dir.clone())
     }
 
     fn run_command(&mut self, command: &str, args: &[&str], working_dir: Option<&Path>) -> io::Result<Output> {

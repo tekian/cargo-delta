@@ -71,6 +71,10 @@ fn normalized_or_original(path: &Path) -> PathBuf {
 }
 
 impl Crates {
+    pub const fn empty() -> Self {
+        Self { crates: BTreeMap::new() }
+    }
+
     pub fn get_dependencies(&self, package_id: &str) -> Option<&Vec<String>> {
         self.crates.get(package_id)
     }

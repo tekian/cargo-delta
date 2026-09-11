@@ -19,6 +19,7 @@ glob = { version = "0.3.3", default-features = false }
 normpath = { version = "1.5.0", default-features = false }
 serde = { version = "1.0.228", default-features = false }
 serde_json = { version = "1.0.149", default-features = false }
+sha2 = { version = "0.10.9", default-features = false }
 syn = { version = "2.0.117", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
 toml = { version = "0.9.8", default-features = false }
