@@ -2,18 +2,22 @@ use crate::error::{Error, Result};
 use crate::host::Host;
 use normpath::PathExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CargoMetadata {
     pub packages: Vec<CargoCrate>,
+    pub workspace_members: Vec<String>,
     pub workspace_root: PathBuf,
     pub target_directory: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CargoCrate {
+    pub id: String,
     pub name: String,
+    pub version: String,
     pub source: Option<String>,
     pub targets: Vec<CargoTarget>,
     pub manifest_path: PathBuf,
@@ -31,6 +35,7 @@ pub struct CargoTarget {
 pub struct CargoDependency {
     pub name: String,
     pub source: Option<String>,
+    pub path: Option<PathBuf>,
 }
 
 /// Get cargo metadata from current working directory
@@ -56,7 +61,8 @@ pub fn metadata(host: &mut impl Host) -> Result<CargoMetadata> {
 }
 
 pub fn get_workspace_crates(metadata: &CargoMetadata) -> Vec<&CargoCrate> {
-    metadata.packages.iter().filter(|pkg| pkg.source.is_none()).collect()
+    let members: HashSet<&str> = metadata.workspace_members.iter().map(String::as_str).collect();
+    metadata.packages.iter().filter(|pkg| members.contains(pkg.id.as_str())).collect()
 }
 
 #[cfg(test)]
@@ -69,12 +75,15 @@ mod tests {
     fn metadata_parses_valid_output() {
         let json = serde_json::json!({
             "packages": [{
+                "id": "path+file:///repo/my-crate#0.1.0",
                 "name": "my-crate",
+                "version": "0.1.0",
                 "source": null,
                 "targets": [{"name": "my-crate", "kind": ["lib"], "src_path": "src/lib.rs"}],
                 "manifest_path": "Cargo.toml",
                 "dependencies": []
             }],
+            "workspace_members": ["path+file:///repo/my-crate#0.1.0"],
             "workspace_root": ".",
             "target_directory": "target"
         });
@@ -84,6 +93,7 @@ mod tests {
         let result = metadata(&mut host).unwrap();
         assert_eq!(result.packages.len(), 1);
         assert_eq!(result.packages[0].name, "my-crate");
+        assert_eq!(result.packages[0].version, "0.1.0");
     }
 
     #[test]
@@ -119,20 +129,25 @@ mod tests {
         let meta = CargoMetadata {
             packages: vec![
                 CargoCrate {
+                    id: "path+file:///repo/local#0.1.0".to_string(),
                     name: "local".to_string(),
+                    version: "0.1.0".to_string(),
                     source: None,
                     targets: vec![],
                     manifest_path: PathBuf::from("Cargo.toml"),
                     dependencies: vec![],
                 },
                 CargoCrate {
+                    id: "registry+https://github.com/rust-lang/crates.io-index#external@1.0.0".to_string(),
                     name: "external".to_string(),
+                    version: "1.0.0".to_string(),
                     source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
                     targets: vec![],
                     manifest_path: PathBuf::from("Cargo.toml"),
                     dependencies: vec![],
                 },
             ],
+            workspace_members: vec!["path+file:///repo/local#0.1.0".to_string()],
             workspace_root: PathBuf::from("."),
             target_directory: PathBuf::from("target"),
         };

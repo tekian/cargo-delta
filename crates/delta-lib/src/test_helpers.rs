@@ -4,10 +4,18 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::Output;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandCall {
+    pub command: String,
+    pub args: Vec<String>,
+    pub working_dir: Option<std::path::PathBuf>,
+}
+
 pub struct TestHost {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: Option<i32>,
+    pub command_calls: Vec<CommandCall>,
     command_responses: VecDeque<io::Result<Output>>,
 }
 
@@ -17,6 +25,7 @@ impl TestHost {
             stdout: Vec::new(),
             stderr: Vec::new(),
             exit_code: None,
+            command_calls: Vec::new(),
             command_responses: VecDeque::new(),
         }
     }
@@ -48,7 +57,12 @@ impl Host for TestHost {
         self.exit_code = Some(code);
     }
 
-    fn run_command(&mut self, _command: &str, _args: &[&str], _working_dir: Option<&Path>) -> io::Result<Output> {
+    fn run_command(&mut self, command: &str, args: &[&str], working_dir: Option<&Path>) -> io::Result<Output> {
+        self.command_calls.push(CommandCall {
+            command: command.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            working_dir: working_dir.map(Path::to_path_buf),
+        });
         self.command_responses
             .pop_front()
             .unwrap_or_else(|| Err(io::Error::other("no more mock command responses")))
@@ -75,4 +89,18 @@ pub fn success_output(stdout: &str) -> Output {
 
 pub fn failure_output(stderr: &str) -> Output {
     make_output(1, "", stderr)
+}
+
+pub fn test_directory(name: &str) -> std::path::PathBuf {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::current_dir()
+        .expect("tests require a current working directory")
+        .join("target")
+        .join("cargo-delta-tests")
+        .join(format!("{name}-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(&path).expect("test directory should be creatable beneath target");
+    path
 }

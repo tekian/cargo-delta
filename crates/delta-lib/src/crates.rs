@@ -1,59 +1,89 @@
 use crate::cargo::CargoMetadata;
+use normpath::PathExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Crates {
-    crates: HashMap<String, Vec<String>>,
+    crates: BTreeMap<String, Vec<String>>,
 }
 
-pub fn parse(metadata: &CargoMetadata) -> Crates {
-    let mut workspace = HashSet::new();
-    let mut dependencies = HashMap::new();
+pub fn parse(metadata: &CargoMetadata) -> Result<Crates> {
+    let workspace: HashSet<&str> = metadata.workspace_members.iter().map(String::as_str).collect();
+    let workspace_packages: Vec<_> = metadata
+        .packages
+        .iter()
+        .filter(|package| workspace.contains(package.id.as_str()))
+        .collect();
+    let mut dependencies = BTreeMap::new();
 
-    for package in &metadata.packages {
-        if package.source.is_some() {
-            continue;
-        }
-        let _ = workspace.insert(package.name.clone());
-        let _ = dependencies.insert(package.name.clone(), Vec::new());
+    for package_id in &metadata.workspace_members {
+        let _ = dependencies.insert(package_id.clone(), Vec::new());
     }
 
-    for package in &metadata.packages {
-        if package.source.is_some() {
-            continue;
-        }
-
-        for dep in &package.dependencies {
-            if dep.source.is_some() || !workspace.contains(&dep.name) {
+    for package in &workspace_packages {
+        let package_deps = dependencies
+            .get_mut(&package.id)
+            .ok_or_else(|| Error::Other(format!("Cargo package '{}' is not a workspace member", package.id)))?;
+        for dependency in &package.dependencies {
+            if dependency.source.is_some() {
                 continue;
             }
 
-            let package_deps = dependencies.get_mut(&package.name).unwrap();
-
-            if !package_deps.contains(&dep.name) {
-                package_deps.push(dep.name.clone());
+            let matches: Vec<_> = workspace_packages
+                .iter()
+                .filter(|candidate| dependency_matches(dependency.path.as_deref(), &dependency.name, candidate))
+                .collect();
+            match matches.as_slice() {
+                [] => {}
+                [dependency_package] => package_deps.push(dependency_package.id.clone()),
+                _ => {
+                    return Err(Error::Other(format!(
+                        "Workspace dependency '{}' of package '{}' does not map to exactly one Cargo package ID",
+                        dependency.name, package.id
+                    )));
+                }
             }
         }
+        package_deps.sort();
+        package_deps.dedup();
     }
 
-    Crates { crates: dependencies }
+    Ok(Crates { crates: dependencies })
+}
+
+fn dependency_matches(dependency_path: Option<&Path>, dependency_name: &str, package: &crate::cargo::CargoCrate) -> bool {
+    if let Some(dependency_path) = dependency_path {
+        let Some(package_directory) = package.manifest_path.parent() else {
+            return false;
+        };
+        return normalized_or_original(dependency_path) == normalized_or_original(package_directory);
+    }
+    package.name == dependency_name
+}
+
+fn normalized_or_original(path: &Path) -> PathBuf {
+    path.normalize()
+        .map_or_else(|_| path.to_path_buf(), normpath::BasePathBuf::into_path_buf)
 }
 
 impl Crates {
-    pub fn get_dependencies(&self, crate_name: &str) -> Option<&Vec<String>> {
-        self.crates.get(crate_name)
+    pub fn get_dependencies(&self, package_id: &str) -> Option<&Vec<String>> {
+        self.crates.get(package_id)
     }
 
-    pub fn get_dependents(&self, crate_name: &str) -> Option<Vec<String>> {
-        if !self.crates.contains_key(crate_name) {
+    pub fn get_dependents(&self, package_id: &str) -> Option<Vec<String>> {
+        if !self.crates.contains_key(package_id) {
             return None;
         }
 
         let mut dependents = Vec::new();
 
         for (name, deps) in &self.crates {
-            if deps.contains(&crate_name.to_string()) {
+            if deps.iter().any(|dependency| dependency == package_id) {
                 dependents.push(name.clone());
             }
         }
@@ -61,13 +91,13 @@ impl Crates {
         Some(dependents)
     }
 
-    pub fn get_dependencies_transitive(&self, crate_name: &str) -> Option<Vec<String>> {
-        if !self.crates.contains_key(crate_name) {
+    pub fn get_dependencies_transitive(&self, package_id: &str) -> Option<Vec<String>> {
+        if !self.crates.contains_key(package_id) {
             return None;
         }
 
         let mut all_dependencies = HashSet::new();
-        let mut to_visit = vec![crate_name.to_string()];
+        let mut to_visit = vec![package_id.to_string()];
         let mut visited = HashSet::new();
 
         while let Some(current_crate) = to_visit.pop() {
@@ -88,13 +118,13 @@ impl Crates {
         Some(all_dependencies.into_iter().collect())
     }
 
-    pub fn get_dependents_transitive(&self, crate_name: &str) -> Option<Vec<String>> {
-        if !self.crates.contains_key(crate_name) {
+    pub fn get_dependents_transitive(&self, package_id: &str) -> Option<Vec<String>> {
+        if !self.crates.contains_key(package_id) {
             return None;
         }
 
         let mut all_dependents = HashSet::new();
-        let mut to_visit = vec![crate_name.to_string()];
+        let mut to_visit = vec![package_id.to_string()];
         let mut visited = HashSet::new();
 
         while let Some(current_crate) = to_visit.pop() {
@@ -119,7 +149,7 @@ impl Crates {
         self.crates.len()
     }
 
-    pub fn get_all_crate_names(&self) -> Vec<String> {
+    pub fn get_all_package_ids(&self) -> Vec<String> {
         self.crates.keys().cloned().collect()
     }
 }
@@ -129,7 +159,7 @@ mod tests {
     use super::*;
 
     fn make_crates(deps: &[(&str, &[&str])]) -> Crates {
-        let mut crates = HashMap::new();
+        let mut crates = BTreeMap::new();
         for (name, dep_list) in deps {
             let _ = crates.insert((*name).to_string(), dep_list.iter().map(|d| (*d).to_string()).collect());
         }
@@ -216,9 +246,9 @@ mod tests {
     }
 
     #[test]
-    fn get_all_crate_names_returns_all() {
+    fn get_all_package_ids_returns_all() {
         let c = make_crates(&[("alpha", &[]), ("beta", &[])]);
-        let mut names = c.get_all_crate_names();
+        let mut names = c.get_all_package_ids();
         names.sort();
         assert_eq!(names, vec!["alpha", "beta"]);
     }

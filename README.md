@@ -56,6 +56,31 @@ cargo install cargo-delta
    cargo delta impact --baseline main.json --current feature.json
    ```
 
+   The same low-level workflow can write portable artifacts without shell
+   redirection:
+
+   ```bash
+   git checkout main
+   cargo delta snapshot --output main.json
+
+   git checkout feature-branch
+   cargo delta snapshot --output feature.json
+
+   cargo delta impact \
+     --baseline main.json \
+     --current feature.json \
+     --base-ref origin/main \
+     --affected \
+     --format packages \
+     --output affected.packages
+   ```
+
+   `affected.packages` contains one sorted `name@version` Cargo package spec per
+   line. If the selection is empty, the file is still created and has zero
+   bytes. `--changed-files PATH` can replace `--base-ref` when CI already has an
+   authoritative UTF-8 JSON change manifest with `changed` and `deleted`
+   arrays; the two options are mutually exclusive.
+
    By default this prints the full `Impact` JSON with all three tiers. Use the
    tier toggles (`--modified`, `--affected`, `--required`) to filter — when none
    are given, all three are included (back-compat). To plug the result straight
@@ -281,7 +306,13 @@ trip_wire_patterns = [
 current checkout. It's the input to `cargo delta impact`.
 
 - **files**: Nested tree of file dependencies as detected by all the heuristics.
-- **crates**: Dependency relationships between crates within the workspace.
+- **packages**: Canonical Cargo package ID, name, version, and Git-root-relative
+  manifest path for every workspace member.
+- **crates**: Dependency relationships between package IDs within the
+  workspace.
+
+Use `--output PATH` to atomically replace a snapshot file. Without it, snapshot
+JSON is written to stdout as before.
 
 ### Impact
 
@@ -291,6 +322,11 @@ crates are impacted, in a JSON shape your CI/CD can consume.
 - **Modified**: Crates directly modified by Git changes.
 - **Affected**: Modified crates plus all their dependents, direct and indirect.
 - **Required**: Affected crates plus all their dependencies, direct and indirect.
+
+Use `--base-ref REF` for an explicit merge-base comparison, or
+`--changed-files PATH` to supply `{"changed":[],"deleted":[]}` paths directly.
+Use `--output PATH` to atomically write any format. The additive `packages`
+format emits one canonical `name@version` spec per line.
 
 
 ## Limitations

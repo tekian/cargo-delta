@@ -47,8 +47,11 @@ impl fmt::Display for FileKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[expect(clippy::use_self, reason = "Self cannot be used in struct field definitions")]
 pub struct FileNode {
+    #[serde(with = "portable_path")]
     pub path: PathBuf,
     pub kind: FileKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_id: Option<String>,
     pub children: Vec<FileNode>,
 }
 
@@ -57,6 +60,16 @@ impl FileNode {
         Self {
             path,
             kind,
+            package_id: None,
+            children: Vec::new(),
+        }
+    }
+
+    pub const fn for_package(path: PathBuf, package_id: String) -> Self {
+        Self {
+            path,
+            kind: FileKind::Crate,
+            package_id: Some(package_id),
             children: Vec::new(),
         }
     }
@@ -67,15 +80,19 @@ impl FileNode {
         }
     }
 
-    pub fn make_relative_paths(&mut self, workspace_root: &Path) {
-        self.path = match self.path.strip_prefix(workspace_root) {
-            Ok(relative) => relative.to_path_buf(),
-            Err(_) => self.path.clone(),
-        };
+    pub fn make_relative_paths(&mut self, workspace_root: &Path) -> Result<()> {
+        self.path = self.path.strip_prefix(workspace_root).map(Path::to_path_buf).map_err(|_error| {
+            crate::error::Error::Other(format!(
+                "Workspace input '{}' is outside Git root '{}'",
+                self.path.display(),
+                workspace_root.display()
+            ))
+        })?;
 
         for child in &mut self.children {
-            child.make_relative_paths(workspace_root);
+            child.make_relative_paths(workspace_root)?;
         }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -93,31 +110,53 @@ impl FileNode {
         paths
     }
 
-    pub fn find_crates_containing_file(&self, target_file: &PathBuf) -> Vec<String> {
-        fn visit(node: &FileNode, target_file: &PathBuf, current_crate: Option<&str>, results: &mut Vec<String>) {
-            let current_crate = if matches!(node.kind, FileKind::Crate) {
-                node.path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+    pub fn find_packages_containing_file(&self, target_file: &PathBuf) -> Vec<String> {
+        fn visit(node: &FileNode, target_file: &PathBuf, current_package: Option<&str>, results: &mut Vec<String>) {
+            let current_package = if matches!(node.kind, FileKind::Crate) {
+                node.package_id.as_deref().or_else(|| {
+                    let name = node.path.parent().and_then(Path::file_name)?;
+                    name.to_str()
+                })
             } else {
-                current_crate
+                current_package
             };
 
             if &node.path == target_file
-                && let Some(crate_name) = current_crate
+                && let Some(package_id) = current_package
             {
-                let crate_string = crate_name.to_string();
-                if !results.contains(&crate_string) {
-                    results.push(crate_string);
+                let package_id = package_id.to_string();
+                if !results.contains(&package_id) {
+                    results.push(package_id);
                 }
             }
 
             for child in &node.children {
-                visit(child, target_file, current_crate, results);
+                visit(child, target_file, current_package, results);
             }
         }
 
         let mut results = Vec::new();
         visit(self, target_file, None, &mut results);
         results
+    }
+}
+
+mod portable_path {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::{Path, PathBuf};
+
+    pub fn serialize<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&path.to_string_lossy().replace('\\', "/"))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(PathBuf::from)
     }
 }
 
@@ -446,7 +485,7 @@ pub fn build_tree(host: &mut impl Host, metadata: &CargoMetadata, crates: &[&Car
     let mut root_node = FileNode::new(root_path, root_kind);
 
     for crate_ in crates {
-        let mut node = FileNode::new(crate_.manifest_path.clone(), FileKind::Crate);
+        let mut node = FileNode::for_package(crate_.manifest_path.clone(), crate_.id.clone());
 
         for target in &crate_.targets {
             let mut target_node = FileNode::new(target.src_path.clone(), FileKind::Target);
@@ -556,38 +595,46 @@ mod tests {
         let mut root = FileNode::new(PathBuf::from("/workspace/Cargo.toml"), FileKind::Workspace);
         root.add_child(FileNode::new(PathBuf::from("/workspace/src/main.rs"), FileKind::Target));
 
-        root.make_relative_paths(&ws);
+        root.make_relative_paths(&ws).unwrap();
 
         assert_eq!(root.path, PathBuf::from("Cargo.toml"));
         assert_eq!(root.children[0].path, PathBuf::from("src/main.rs"));
     }
 
     #[test]
-    fn make_relative_paths_preserves_unrelated() {
+    fn make_relative_paths_rejects_unrelated() {
         let ws = PathBuf::from("/workspace");
         let mut node = FileNode::new(PathBuf::from("/other/file.rs"), FileKind::Module);
-        node.make_relative_paths(&ws);
-        assert_eq!(node.path, PathBuf::from("/other/file.rs"));
+        let error = node.make_relative_paths(&ws).unwrap_err();
+        assert!(error.to_string().contains("outside Git root"));
     }
 
     #[test]
-    fn find_crates_containing_file_finds_match() {
+    fn find_packages_containing_file_finds_match() {
         let mut root = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
-        let mut crate_node = FileNode::new(PathBuf::from("my-crate/Cargo.toml"), FileKind::Crate);
+        let mut crate_node = FileNode::for_package(PathBuf::from("my-crate/Cargo.toml"), "path+file:///repo/my-crate#0.1.0".to_string());
         crate_node.add_child(FileNode::new(PathBuf::from("my-crate/src/lib.rs"), FileKind::Target));
         root.add_child(crate_node);
 
         let target = PathBuf::from("my-crate/src/lib.rs");
-        let crates = root.find_crates_containing_file(&target);
-        assert_eq!(crates, vec!["my-crate"]);
+        let packages = root.find_packages_containing_file(&target);
+        assert_eq!(packages, vec!["path+file:///repo/my-crate#0.1.0"]);
     }
 
     #[test]
-    fn find_crates_containing_file_returns_empty_for_no_match() {
+    fn find_packages_containing_file_returns_empty_for_no_match() {
         let root = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
         let target = PathBuf::from("nonexistent.rs");
-        let crates = root.find_crates_containing_file(&target);
-        assert!(crates.is_empty());
+        let packages = root.find_packages_containing_file(&target);
+        assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn serialized_paths_always_use_slashes() {
+        let node = FileNode::new(PathBuf::from(r"crates\example\src\lib.rs"), FileKind::Target);
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("crates/example/src/lib.rs"));
+        assert!(!json.contains(r"crates\\example"));
     }
 
     #[test]
