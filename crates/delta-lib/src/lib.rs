@@ -51,10 +51,10 @@ enum CargoSubcommand {
     Delta(Args),
 }
 
-/// Identify impacted crates from git changes.
+/// Identify impacted Cargo packages from Git changes.
 #[derive(Parser)]
 #[command(name = "cargo-delta", author, version, long_about = None, display_name = "cargo-delta")]
-#[command(about = "Identify impacted crates from git changes")]
+#[command(about = "Identify impacted Cargo packages from Git changes")]
 struct Args {
     /// Path to configuration file (defaults to `delta.toml`)
     #[arg(short = 'c', long, value_name = "PATH")]
@@ -66,7 +66,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Compute impacted crates from a pair of snapshots
+    /// Compute impacted Cargo packages from a pair of snapshots
     #[command(alias = "run")]
     Impact(ImpactCommand),
     /// Snapshot the current workspace into a JSON artifact
@@ -96,15 +96,15 @@ struct ImpactCommand {
     /// e.g. `cargo build $(cargo delta run ... -f cargo-args)`.
     #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::Json)]
     format: OutputFormat,
-    /// Include crates directly modified by Git changes. If none of `--modified`,
+    /// Include packages directly modified by Git changes. If none of `--modified`,
     /// `--affected`, `--required` are given, all three are included (default).
     #[arg(long)]
     modified: bool,
-    /// Include modified crates plus their transitive dependents. If none of `--modified`,
+    /// Include modified packages plus their transitive dependents. If none of `--modified`,
     /// `--affected`, `--required` are given, all three are included (default).
     #[arg(long)]
     affected: bool,
-    /// Include affected crates plus their transitive dependencies. If none of `--modified`,
+    /// Include affected packages plus their transitive dependencies. If none of `--modified`,
     /// `--affected`, `--required` are given, all three are included (default).
     #[arg(long)]
     required: bool,
@@ -116,14 +116,14 @@ enum OutputFormat {
     /// `Impact` JSON object containing only the selected tiers (default emits all three,
     /// backward compatible).
     Json,
-    /// One crate name per line - convenient for `xargs` or shell loops.
+    /// One bare package name per line - convenient for `xargs` or shell loops.
     Names,
     /// Space-separated `-p NAME` arguments - drop straight into a `cargo` invocation
     /// via `$(cargo delta run ... -f cargo-args)`.
     CargoArgs,
     /// Space-separated `--exclude NAME` arguments for the *complement* of the selected
     /// tier(s) within the workspace. Use with `cargo --workspace` to scope to impacted
-    /// crates without `-p` ambiguity (since `--exclude` matches workspace members only,
+    /// packages without `-p` ambiguity (since `--exclude` matches workspace members only,
     /// it can't collide with same-named transitive registry deps). Empty when the
     /// selected tier covers (or exceeds) the workspace; combine with `-f names` for
     /// a "nothing impacted" check.

@@ -22,8 +22,10 @@
     - [File Exclusion](#file-exclusion)
     - [Trip Wire](#trip-wire)
 - [Output](#output)
+    - [Terminology](#terminology)
     - [Snapshot](#snapshot)
     - [Impact](#impact)
+    - [Impact output formats](#impact-output-formats)
 - [Limitations](#limitations)
 - [Example](#example)
 - [Contributing](#contributing)
@@ -87,8 +89,11 @@ cargo install cargo-delta
    into `cargo`, change the format:
 
    ```bash
-   # One crate per line — good for xargs / shell loops.
+   # One bare package name per line — good for xargs / shell loops.
    cargo delta impact --baseline main.json --current feature.json -f names --affected
+
+   # One unambiguous Cargo package spec per line.
+   cargo delta impact --baseline main.json --current feature.json -f packages --affected
 
    # `-p NAME` pairs — drop into any cargo invocation via $(...).
    cargo build $(cargo delta impact --baseline main.json --current feature.json -f cargo-args --affected)
@@ -103,9 +108,9 @@ cargo install cargo-delta
    cargo delta impact --baseline main.json --current feature.json --required
    ```
 
-   Combining tier toggles for `names` / `cargo-args` emits the **union** of the
-   selected tiers (deduplicated, sorted). The human-readable summary is written
-   to stderr, so `$(...)` capture stays clean.
+   Every non-JSON format emits the **union** of the selected tiers,
+   deduplicated and sorted. The human-readable summary is written to stderr, so
+   stdout and `--output` contain only the selected machine-readable format.
 
    > The legacy subcommand names `analyze` (= `snapshot`) and `run` (= `impact`)
    > continue to work as hidden aliases for back-compat.
@@ -300,33 +305,71 @@ trip_wire_patterns = [
 
 ## Output
 
+### Terminology
+
+Cargo's unit of workspace membership is a **package**: one `Cargo.toml` with a
+name and version. A package may build one or more Rust **crates** (library,
+binary, example, test, and build-script targets), but cargo-delta computes
+impact at package granularity.
+
+The snapshot JSON retains a top-level field named `crates` for compatibility
+with existing snapshots. Despite that legacy name, it is a graph of **Cargo
+packages**, not a list of rustc crate targets:
+
+| Snapshot field | Meaning |
+| --- | --- |
+| `packages` | Canonical identity table for current workspace members. Each record contains Cargo's package ID, package name, version, and Git-root-relative `Cargo.toml` path. |
+| `files` | Recursive ownership/dependency tree for workspace inputs. Nodes identify manifests, Cargo targets, Rust modules, `include!` files, configured file references, and assumed inputs. A package-root node carries the owning Cargo package ID. |
+| `crates` | Legacy-named adjacency map from each Cargo package ID to the IDs of its direct workspace-package dependencies. cargo-delta traverses this graph to compute dependents and dependencies. |
+
+Impact JSON uses bare package names for backward compatibility. Use
+`--format packages` when a consumer needs unambiguous `name@version` Cargo
+specs.
+
 ### Snapshot
 
 `cargo delta snapshot` writes a JSON artifact describing the workspace at the
 current checkout. It's the input to `cargo delta impact`.
 
-- **files**: Nested tree of file dependencies as detected by all the heuristics.
-- **packages**: Canonical Cargo package ID, name, version, and Git-root-relative
-  manifest path for every workspace member.
-- **crates**: Dependency relationships between package IDs within the
-  workspace.
+The three main fields are described in [Terminology](#terminology). Snapshot
+schema `1` uses canonical Cargo package IDs for both file ownership and
+dependency edges. `cargo delta impact` also continues to read the unversioned
+snapshot shape written by cargo-delta 0.3.
 
 Use `--output PATH` to atomically replace a snapshot file. Without it, snapshot
 JSON is written to stdout as before.
 
 ### Impact
 
-`cargo delta impact` compares two snapshots plus the git diff and prints which
-crates are impacted, in a JSON shape your CI/CD can consume.
+`cargo delta impact` compares two snapshots plus the Git change set and reports
+which workspace packages are impacted.
 
-- **Modified**: Crates directly modified by Git changes.
-- **Affected**: Modified crates plus all their dependents, direct and indirect.
-- **Required**: Affected crates plus all their dependencies, direct and indirect.
+- **Modified**: Packages that directly own a changed input.
+- **Affected**: Modified packages plus all their dependents, direct and indirect.
+- **Required**: Affected packages plus all their dependencies, direct and indirect.
 
 Use `--base-ref REF` for an explicit merge-base comparison, or
 `--changed-files PATH` to supply `{"changed":[],"deleted":[]}` paths directly.
-Use `--output PATH` to atomically write any format. The additive `packages`
-format emits one canonical `name@version` spec per line.
+Use `--output PATH` to atomically write any format instead of stdout.
+
+### Impact output formats
+
+Select the format with `-f FORMAT` or `--format FORMAT`. The default is
+`json`. With no tier flag, all three tiers are selected. For every non-JSON
+format, selecting multiple tiers emits their sorted, deduplicated union.
+
+| Format | Output | Typical use |
+| --- | --- | --- |
+| `json` | JSON object with one array for each selected tier (`Modified`, `Affected`, `Required`). Values are bare package names. Unlike other formats, tiers remain separate. | Durable reports and structured CI processing. |
+| `names` | One bare package name per line. | `xargs`, display, or checking whether a tier is empty. |
+| `packages` | One canonical `name@version` Cargo package spec per line. | Passing a selection to tools that read package files without risking same-name ambiguity. |
+| `cargo-args` | One space-separated line of `-p NAME` pairs. | Shell expansion into Cargo commands, for example `cargo test $(cargo delta impact ... -f cargo-args)`. |
+| `cargo-excludes` | One space-separated line containing `--exclude NAME` for every workspace package outside the selected union. | Combine with Cargo's `--workspace` flag when exclusion is safer than positive package selection. |
+
+`names`, `packages`, and `cargo-args` produce zero bytes for an empty
+selection. `cargo-excludes` instead lists the whole workspace when the
+selection is empty, and produces zero bytes when the selection already covers
+the whole workspace.
 
 
 ## Limitations
