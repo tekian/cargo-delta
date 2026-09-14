@@ -31,14 +31,25 @@ the same bytes are written to a temporary sibling, flushed, and atomically
 replace `PATH`. An error before replacement leaves an existing artifact
 unchanged.
 
-Snapshot schema 1 records every workspace member using:
+Snapshot schema 1 contains:
 
 ```json
 {
-  "id": "path+file:///repo/crates/foo#foo@1.2.3",
-  "name": "foo",
-  "version": "1.2.3",
-  "manifest_path": "crates/foo/Cargo.toml"
+  "schema": 1,
+  "packages": [{
+    "id": "path+file:///repo/crates/foo#foo@1.2.3",
+    "name": "foo",
+    "version": "1.2.3",
+    "manifest_path": "crates/foo/Cargo.toml"
+  }],
+  "files": {
+    "path": "Cargo.toml",
+    "kind": "Workspace",
+    "children": []
+  },
+  "dependencies": {
+    "path+file:///repo/crates/foo#foo@1.2.3": []
+  }
 }
 ```
 
@@ -47,11 +58,9 @@ serialize with `/` separators. File ownership and workspace dependency edges
 reference package IDs; package names and target names are not used as graph
 identity.
 
-The reader accepts the unversioned cargo-delta 0.3 snapshot shape. Legacy
-snapshots continue to support the existing name-based formats. A legacy
-current snapshot cannot produce `packages` output because it has no package
-versions. When a legacy package name maps to multiple current package
-identities, impact computation fails rather than guessing.
+Snapshots are derived cache artifacts. The reader accepts only schema 1;
+unversioned cargo-delta 0.3 snapshots and unknown future schemas fail with
+guidance to regenerate both inputs.
 
 ## Low-level impact command
 
@@ -116,8 +125,8 @@ packages deleted from the baseline are not emitted as current packages.
   output failures exit with status 1 and write diagnostics to stderr.
 - Clap usage errors, including conflicting change-source options, use Clap's
   usage-error status.
-- Snapshot schema 1 and the unversioned 0.3 schema are accepted. Other schema
-  versions fail with a message listing the supported versions.
+- Only snapshot schema 1 is accepted. Missing, older, or newer schemas fail
+  with a command that regenerates the input.
 
 ## Follow-up work (not implemented)
 

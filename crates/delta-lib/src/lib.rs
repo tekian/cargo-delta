@@ -16,13 +16,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::MainConfig;
-use crate::crates::Crates;
+use crate::dependencies::PackageDependencies;
 use crate::files::{FileKind, FileNode};
 use crate::git::GitDiff;
 
 mod cargo;
 mod config;
-mod crates;
+mod dependencies;
 mod error;
 mod files;
 mod git;
@@ -182,10 +182,9 @@ struct Impact {
 struct WorkspaceTree {
     #[serde(default)]
     pub schema: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packages: Vec<PackageIdentity>,
     pub files: FileNode,
-    pub crates: Crates,
+    pub dependencies: PackageDependencies,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,60 +199,51 @@ const SNAPSHOT_SCHEMA: u32 = 1;
 
 impl WorkspaceTree {
     fn validate(&self) -> error::Result<()> {
-        match self.schema {
-            0 => {
-                if !self.packages.is_empty() {
-                    return Err(error::Error::Other(
-                        "Legacy snapshot schema must not contain package identity records".to_string(),
-                    ));
-                }
-            }
-            SNAPSHOT_SCHEMA => {
-                let mut package_ids = HashSet::new();
-                let mut package_specs = HashSet::new();
-                for package in &self.packages {
-                    if !package_ids.insert(package.id.as_str()) {
-                        return Err(error::Error::Other(format!(
-                            "Snapshot schema {SNAPSHOT_SCHEMA} contains duplicate package ID '{}'",
-                            package.id
-                        )));
-                    }
-                    let spec = format!("{}@{}", package.name, package.version);
-                    if !package_specs.insert(spec.clone()) {
-                        return Err(error::Error::Other(format!(
-                            "Snapshot schema {SNAPSHOT_SCHEMA} contains ambiguous package spec '{spec}'"
-                        )));
-                    }
-                    validate_portable_relative_path(&package.manifest_path)?;
-                }
+        if self.schema != SNAPSHOT_SCHEMA {
+            return Err(error::Error::Other(format!(
+                "Unsupported snapshot schema {}; cargo-delta requires schema {SNAPSHOT_SCHEMA}. Regenerate this snapshot with `cargo delta snapshot`",
+                self.schema
+            )));
+        }
 
-                for package_id in self.crates.get_all_package_ids() {
-                    if !package_ids.contains(package_id.as_str()) {
-                        return Err(error::Error::Other(format!(
-                            "Snapshot dependency graph refers to unknown package ID '{package_id}'"
-                        )));
-                    }
-                    for dependency_id in self.crates.get_dependencies(&package_id).into_iter().flatten() {
-                        if !package_ids.contains(dependency_id.as_str()) {
-                            return Err(error::Error::Other(format!(
-                                "Snapshot dependency graph refers to unknown dependency package ID '{dependency_id}'"
-                            )));
-                        }
-                    }
-                }
-                if package_ids.len() != self.crates.len() {
-                    return Err(error::Error::Other(
-                        "Snapshot package identities and dependency graph contain different workspace members".to_string(),
-                    ));
-                }
-                validate_file_tree(&self.files, &package_ids)?;
-            }
-            schema => {
+        let mut package_ids = HashSet::new();
+        let mut package_specs = HashSet::new();
+        for package in &self.packages {
+            if !package_ids.insert(package.id.as_str()) {
                 return Err(error::Error::Other(format!(
-                    "Unsupported snapshot schema {schema}; supported schemas are legacy 0.3 (unversioned) and {SNAPSHOT_SCHEMA}"
+                    "Snapshot schema {SNAPSHOT_SCHEMA} contains duplicate package ID '{}'",
+                    package.id
                 )));
             }
+            let spec = format!("{}@{}", package.name, package.version);
+            if !package_specs.insert(spec.clone()) {
+                return Err(error::Error::Other(format!(
+                    "Snapshot schema {SNAPSHOT_SCHEMA} contains ambiguous package spec '{spec}'"
+                )));
+            }
+            validate_portable_relative_path(&package.manifest_path)?;
         }
+
+        for package_id in self.dependencies.get_all_package_ids() {
+            if !package_ids.contains(package_id.as_str()) {
+                return Err(error::Error::Other(format!(
+                    "Snapshot dependency graph refers to unknown package ID '{package_id}'"
+                )));
+            }
+            for dependency_id in self.dependencies.get_dependencies(&package_id).into_iter().flatten() {
+                if !package_ids.contains(dependency_id.as_str()) {
+                    return Err(error::Error::Other(format!(
+                        "Snapshot dependency graph refers to unknown dependency package ID '{dependency_id}'"
+                    )));
+                }
+            }
+        }
+        if package_ids.len() != self.dependencies.len() {
+            return Err(error::Error::Other(
+                "Snapshot package identities and dependency graph contain different workspace members".to_string(),
+            ));
+        }
+        validate_file_tree(&self.files, &package_ids)?;
         Ok(())
     }
 
@@ -268,12 +258,6 @@ impl WorkspaceTree {
     }
 
     fn package_specs(&self, package_ids: &HashSet<String>) -> error::Result<Vec<String>> {
-        if self.schema == 0 {
-            return Err(error::Error::Other(
-                "The packages output format requires a schema 1 current snapshot; legacy 0.3 snapshots do not contain versions".to_string(),
-            ));
-        }
-
         let mut specs_to_ids: HashMap<String, Vec<&str>> = HashMap::new();
         for package in &self.packages {
             specs_to_ids
@@ -310,14 +294,6 @@ impl WorkspaceTree {
     }
 
     fn package_name(&self, package_id: &str) -> error::Result<String> {
-        if self.schema == 0 {
-            return self
-                .crates
-                .get_dependencies(package_id)
-                .map(|_| package_id.to_string())
-                .ok_or_else(|| error::Error::Other(format!("Legacy snapshot has no package named '{package_id}'")));
-        }
-
         self.package_by_id(package_id).map(|package| package.name.clone()).ok_or_else(|| {
             error::Error::Other(format!(
                 "Impact result package ID '{package_id}' does not map to exactly one current package"
@@ -330,20 +306,9 @@ impl WorkspaceTree {
     }
 
     fn current_id_for(&self, source: &Self, source_id: &str) -> error::Result<Option<String>> {
-        if source.schema == 0 {
-            return self.unique_id_by_name(source_id);
-        }
-
         let source_package = source
             .package_by_id(source_id)
             .ok_or_else(|| error::Error::Other(format!("Snapshot file ownership refers to unknown package ID '{source_id}'")))?;
-
-        if self.schema == 0 {
-            return Ok(self
-                .crates
-                .get_dependencies(&source_package.name)
-                .map(|_| source_package.name.clone()));
-        }
 
         let matches: Vec<&PackageIdentity> = self
             .packages
@@ -360,21 +325,6 @@ impl WorkspaceTree {
             _ => Err(error::Error::Other(format!(
                 "Package '{}@{}' at '{}' does not map to exactly one current package identity",
                 source_package.name, source_package.version, source_package.manifest_path
-            ))),
-        }
-    }
-
-    fn unique_id_by_name(&self, name: &str) -> error::Result<Option<String>> {
-        if self.schema == 0 {
-            return Ok(self.crates.get_dependencies(name).map(|_| name.to_string()));
-        }
-
-        let matches: Vec<&PackageIdentity> = self.packages.iter().filter(|package| package.name == name).collect();
-        match matches.as_slice() {
-            [] => Ok(None),
-            [package] => Ok(Some(package.id.clone())),
-            _ => Err(error::Error::Other(format!(
-                "Legacy package name '{name}' does not map to exactly one current package identity"
             ))),
         }
     }
@@ -578,8 +528,8 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
     let mut workspace_crates = cargo::get_workspace_crates(&metadata);
     workspace_crates.sort_by(|left, right| left.id.cmp(&right.id));
     let mut files = files::build_tree(host, &metadata, &workspace_crates, config);
-    let crates = match crates::parse(&metadata) {
-        Ok(crates) => crates,
+    let dependencies = match dependencies::parse(&metadata) {
+        Ok(dependencies) => dependencies,
         Err(error) => {
             let _ = writeln!(host.error(), "Error creating workspace dependency graph: {error}");
             host.exit(1);
@@ -601,7 +551,7 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
         return;
     }
 
-    let _ = writeln!(host.error(), "Found {} crate(s) in the workspace.", crates.len());
+    let _ = writeln!(host.error(), "Found {} package(s) in the workspace.", dependencies.len());
     let _ = writeln!(host.error(), "Found {} file(s) in the workspace.", files.len());
     let _ = writeln!(host.error());
 
@@ -609,7 +559,7 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
         schema: SNAPSHOT_SCHEMA,
         packages,
         files,
-        crates,
+        dependencies,
     };
     if let Err(error) = workspace_tree.validate() {
         let _ = writeln!(host.error(), "Error validating workspace snapshot: {error}");
@@ -772,25 +722,25 @@ fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, co
         return;
     }
 
-    let total_crates = current_tree.crates.len();
+    let total_packages = current_tree.dependencies.len();
 
-    let required_crates_len = result.required.len();
-    let affected_crates_len = result.affected.len();
-    let modified_crates_len = result.modified.len();
+    let required_packages_len = result.required.len();
+    let affected_packages_len = result.affected.len();
+    let modified_packages_len = result.modified.len();
 
     let _ = writeln!(
         host.error(),
-        "Modified    {modified_crates_len:>3} (Crates directly modified by Git changes.)"
+        "Modified    {modified_packages_len:>3} (Packages directly modified by Git changes.)"
     );
     let _ = writeln!(
         host.error(),
-        "Affected    {affected_crates_len:>3} (Modified crates plus all their dependents, direct and indirect.)"
+        "Affected    {affected_packages_len:>3} (Modified packages plus all their dependents, direct and indirect.)"
     );
     let _ = writeln!(
         host.error(),
-        "Required    {required_crates_len:>3} (Affected crates plus all their dependencies, direct and indirect.)"
+        "Required    {required_packages_len:>3} (Affected packages plus all their dependencies, direct and indirect.)"
     );
-    let _ = writeln!(host.error(), "Total       {total_crates:>3} (Total crates in this workspace.)");
+    let _ = writeln!(host.error(), "Total       {total_packages:>3} (Total packages in this workspace.)");
     let _ = writeln!(host.error());
 }
 
@@ -832,7 +782,7 @@ fn emit_result(result: &Impact, workspace: &WorkspaceTree, format: OutputFormat,
         OutputFormat::CargoExcludes => {
             let selected: HashSet<String> = union_of_tiers(result, tiers).into_iter().collect();
             let unselected: HashSet<String> = workspace
-                .crates
+                .dependencies
                 .get_all_package_ids()
                 .into_iter()
                 .filter(|package_id| !selected.contains(package_id))
@@ -911,7 +861,7 @@ fn trip_wire_impact(host: &mut impl Host, current_tree: &WorkspaceTree, git_diff
     }
     let _ = writeln!(host.error());
 
-    let all_packages: HashSet<String> = current_tree.crates.get_all_package_ids().into_iter().collect();
+    let all_packages: HashSet<String> = current_tree.dependencies.get_all_package_ids().into_iter().collect();
     Some(Impact {
         modified: all_packages.clone(),
         affected: all_packages.clone(),
@@ -943,7 +893,7 @@ fn get_impacted_crates(
                 continue;
             }
 
-            if let Some(dependents) = baseline_tree.crates.get_dependents_transitive(&baseline_id) {
+            if let Some(dependents) = baseline_tree.dependencies.get_dependents_transitive(&baseline_id) {
                 for dependent in dependents {
                     if let Some(current_id) = current_tree.current_id_for(baseline_tree, &dependent)? {
                         let _ = affected_seeds.insert(current_id);
@@ -986,7 +936,7 @@ fn get_impacted_crates(
     let mut affected = modified.clone();
     affected.extend(affected_seeds);
     for package_id in affected.clone() {
-        if let Some(transitive_dependents) = current_tree.crates.get_dependents_transitive(&package_id) {
+        if let Some(transitive_dependents) = current_tree.dependencies.get_dependents_transitive(&package_id) {
             for dependent in transitive_dependents {
                 let _ = affected.insert(dependent);
             }
@@ -996,7 +946,7 @@ fn get_impacted_crates(
     // Required = Affected + all their dependencies
     let mut required = affected.clone();
     for package_id in &affected {
-        if let Some(transitive_deps) = current_tree.crates.get_dependencies_transitive(package_id) {
+        if let Some(transitive_deps) = current_tree.dependencies.get_dependencies_transitive(package_id) {
             for dependency in transitive_deps {
                 let _ = required.insert(dependency);
             }
@@ -1056,13 +1006,13 @@ mod tests {
 
     fn make_file_tree(crate_files: &[(&str, &[&str])]) -> FileNode {
         let mut root = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
-        for (crate_name, files) in crate_files {
-            let manifest = PathBuf::from(format!("{crate_name}/Cargo.toml"));
-            let mut crate_node = FileNode::new(manifest, FileKind::Crate);
+        for (package_id, files) in crate_files {
+            let manifest = PathBuf::from(format!("{package_id}/Cargo.toml"));
+            let mut package_node = FileNode::for_package(manifest, (*package_id).to_owned());
             for file in *files {
-                crate_node.add_child(FileNode::new(PathBuf::from(*file), FileKind::Target));
+                package_node.add_child(FileNode::new(PathBuf::from(*file), FileKind::Target));
             }
-            root.add_child(crate_node);
+            root.add_child(package_node);
         }
         root
     }
@@ -1073,13 +1023,22 @@ mod tests {
 
         let metadata = make_metadata(&deps);
         let files = make_file_tree(&crate_files);
-        let crates_graph = crates::parse(&metadata).unwrap();
+        let packages = metadata
+            .packages
+            .iter()
+            .map(|package| PackageIdentity {
+                id: package.id.clone(),
+                name: package.name.clone(),
+                version: package.version.clone(),
+                manifest_path: format!("{}/Cargo.toml", package.name),
+            })
+            .collect();
 
         WorkspaceTree {
-            schema: 0,
-            packages: Vec::new(),
+            schema: SNAPSHOT_SCHEMA,
+            packages,
             files,
-            crates: crates_graph,
+            dependencies: dependencies::parse(&metadata).unwrap(),
         }
     }
 
@@ -1134,7 +1093,7 @@ mod tests {
             schema: SNAPSHOT_SCHEMA,
             packages,
             files,
-            crates: crates::parse(&metadata).unwrap(),
+            dependencies: dependencies::parse(&metadata).unwrap(),
         }
     }
 
@@ -1278,37 +1237,6 @@ mod tests {
 
         assert_eq!(result.modified, HashSet::from([LIB_ID.to_string()]));
         assert_eq!(result.affected, HashSet::from([LIB_ID.to_string(), APP_ID.to_string()]));
-    }
-
-    #[test]
-    fn legacy_package_name_mapping_rejects_ambiguous_current_identity() {
-        let baseline = make_workspace(&[("shared", &["shared/src/lib.rs"], &[])]);
-        let current = make_schema1_workspace(&[
-            (
-                "path+file:///repo/a#shared@1.0.0",
-                "shared",
-                "1.0.0",
-                "a/Cargo.toml",
-                &["a/src/lib.rs"],
-                &[],
-            ),
-            (
-                "path+file:///repo/b#shared@2.0.0",
-                "shared",
-                "2.0.0",
-                "b/Cargo.toml",
-                &["b/src/lib.rs"],
-                &[],
-            ),
-        ]);
-        let diff = GitDiff {
-            changed: Vec::new(),
-            deleted: vec![PathBuf::from("shared/src/lib.rs")],
-        };
-
-        let error = get_impacted_crates(&mut TestHost::new(), &baseline, &current, &diff, &MainConfig::default()).unwrap_err();
-
-        assert!(error.to_string().contains("does not map to exactly one current package identity"));
     }
 
     #[test]
@@ -1574,7 +1502,7 @@ mod tests {
         let impact = Impact {
             modified: HashSet::new(),
             affected: HashSet::new(),
-            required: workspace.crates.get_all_package_ids().into_iter().collect(),
+            required: workspace.dependencies.get_all_package_ids().into_iter().collect(),
         };
 
         let output = emit_result(&impact, &workspace, OutputFormat::Packages, TierMask::resolve(false, false, true)).unwrap();
@@ -1635,16 +1563,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unversioned_snapshot_is_accepted() {
-        let directory = test_directory("legacy-snapshot");
+    fn unversioned_snapshot_is_rejected_with_regeneration_guidance() {
+        let directory = test_directory("unversioned-snapshot");
         let path = directory.join("snapshot.json");
-        let legacy = make_workspace(&[("legacy", &["legacy/src/lib.rs"], &[])]);
-        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let snapshot = make_workspace(&[("alpha", &["alpha/src/lib.rs"], &[])]);
+        let mut snapshot = serde_json::to_value(snapshot).unwrap();
+        let _removed_schema = snapshot.as_object_mut().unwrap().remove("schema");
+        std::fs::write(&path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
 
-        let loaded = load_snapshot(&path).unwrap();
+        let error = load_snapshot(&path).unwrap_err();
 
-        assert_eq!(loaded.schema, 0);
-        assert_eq!(loaded.package_name("legacy").unwrap(), "legacy");
+        assert!(error.to_string().contains("Unsupported snapshot schema 0"));
+        assert!(error.to_string().contains("Regenerate this snapshot"));
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -1881,6 +1811,9 @@ mod tests {
         assert!(file_host.stdout.is_empty());
         assert!(file_host.exit_code.is_none());
         let file_bytes = std::fs::read(&destination).unwrap();
+        let snapshot_json: serde_json::Value = serde_json::from_slice(&file_bytes).unwrap();
+        assert!(snapshot_json.get("dependencies").is_some());
+        assert!(snapshot_json.get("crates").is_none());
         let snapshot: WorkspaceTree = serde_json::from_slice(&file_bytes).unwrap();
         assert_eq!(snapshot.schema, SNAPSHOT_SCHEMA);
         assert_eq!(

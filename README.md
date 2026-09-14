@@ -5,7 +5,7 @@
 [![Coverage](https://codecov.io/gh/tekian/cargo-delta/graph/badge.svg)](https://codecov.io/gh/tekian/cargo-delta)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-`cargo-delta` detects which crates in a Cargo workspace are impacted by changes in a Git feature branch. Build, test, and benchmark only the crates you need.
+`cargo-delta` detects which packages in a Cargo workspace are impacted by changes in a Git feature branch. Build, test, and benchmark only the packages you need.
 
 - [Installation](#installation)
 - [Usage](#usage)
@@ -22,7 +22,6 @@
     - [File Exclusion](#file-exclusion)
     - [Trip Wire](#trip-wire)
 - [Output](#output)
-    - [Terminology](#terminology)
     - [Snapshot](#snapshot)
     - [Impact](#impact)
     - [Impact output formats](#impact-output-formats)
@@ -118,7 +117,7 @@ cargo install cargo-delta
 
 ### CI/CD Integration
 
-`cargo-delta` is designed to speed up PR builds by building and testing only impacted crates.
+`cargo-delta` is designed to speed up PR builds by building and testing only impacted packages.
 Since detection is best-effort, a **backstop build** must run separately to catch anything delta missed or was misconfigured for.
 
 **PR pipeline** — snapshot both branches, then capture each tier into its own
@@ -127,7 +126,7 @@ variable. Different cargo commands need different tiers:
 | Command | Tier | Reasoning |
 |---|---|---|
 | `cargo fmt --check`, `cargo clippy` | `--modified` | Lints and formatting only matter for code the PR actually touched. Untouched code already passed on `main`. |
-| `cargo build`, `cargo test`, `cargo bench` | `--affected` | A modified crate can break a dependent's compile or behavior, so downstream needs to be built and tested too. |
+| `cargo build`, `cargo test`, `cargo bench` | `--affected` | A modified package can break a dependent's compile or behavior, so downstream needs to be built and tested too. |
 | `cargo doc`, vendor verification | `--required` | Needs transitive dependencies in scope. |
 
 ```yaml
@@ -137,7 +136,7 @@ variable. Different cargo commands need different tiers:
 - name: Snapshot current (PR)
   run: git checkout $PR_BRANCH && cargo delta snapshot > current.json
 
-- name: Build, test, lint impacted crates
+- name: Build, test, lint impacted packages
   run: |
     MODIFIED=$(cargo delta impact --baseline baseline.json --current current.json -f cargo-args --modified)
     AFFECTED=$(cargo delta impact --baseline baseline.json --current current.json -f cargo-args --affected)
@@ -286,7 +285,7 @@ file_exclude_patterns = ["target/**", "*.tmp"]
 
 ### Trip Wire
 
-If any changed or deleted file matches a trip wire pattern, all crates are considered impacted.
+If any changed or deleted file matches a trip wire pattern, all packages are considered impacted.
 
 Config default:
 
@@ -306,36 +305,71 @@ trip_wire_patterns = [
 
 ## Output
 
-### Terminology
-
-Cargo's unit of workspace membership is a **package**: one `Cargo.toml` with a
-name and version. A package may build one or more Rust **crates** (library,
-binary, example, test, and build-script targets), but cargo-delta computes
-impact at package granularity.
-
-The snapshot JSON retains a top-level field named `crates` for compatibility
-with existing snapshots. Despite that legacy name, it is a graph of **Cargo
-packages**, not a list of rustc crate targets:
-
-| Snapshot field | Meaning |
-| --- | --- |
-| `packages` | Canonical identity table for current workspace members. Each record contains Cargo's package ID, package name, version, and Git-root-relative `Cargo.toml` path. |
-| `files` | Recursive ownership/dependency tree for workspace inputs. Nodes identify manifests, Cargo targets, Rust modules, `include!` files, configured file references, and assumed inputs. A package-root node carries the owning Cargo package ID. |
-| `crates` | Legacy-named adjacency map from each Cargo package ID to the IDs of its direct workspace-package dependencies. cargo-delta traverses this graph to compute dependents and dependencies. |
-
-Impact JSON uses bare package names for backward compatibility. Use
-`--format packages` when a consumer needs unambiguous `name@version` Cargo
-specs.
-
 ### Snapshot
 
 `cargo delta snapshot` writes a JSON artifact describing the workspace at the
 current checkout. It's the input to `cargo delta impact`.
 
-The three main fields are described in [Terminology](#terminology). Snapshot
-schema `1` uses canonical Cargo package IDs for both file ownership and
-dependency edges. `cargo delta impact` also continues to read the unversioned
-snapshot shape written by cargo-delta 0.3.
+Cargo's unit of workspace membership is a **package**: one `Cargo.toml` with a
+name and version. A package may build multiple Rust crates or targets, but
+cargo-delta computes impact between packages because that is the unit Cargo's
+`-p`/`--package` interface can consume.
+
+Schema `1` has three data fields:
+
+- **`packages`** is the canonical identity table for workspace members. Each
+  record contains Cargo's package ID, package name, version, and
+  Git-root-relative manifest path.
+- **`files`** is the recursive input tree. Its nodes represent manifests,
+  Cargo targets, Rust modules, `include!` inputs, configured file references,
+  and assumed inputs. Each package-root node carries the owning package ID.
+- **`dependencies`** maps each package ID to its direct workspace dependency
+  package IDs. cargo-delta traverses it in both directions to compute affected
+  and required sets.
+
+For example, a two-package workspace snapshot starts like this:
+
+```json
+{
+  "schema": 1,
+  "packages": [
+    {
+      "id": "path+file:///repo/crates/app#app@1.0.0",
+      "name": "app",
+      "version": "1.0.0",
+      "manifest_path": "crates/app/Cargo.toml"
+    },
+    {
+      "id": "path+file:///repo/crates/core#core@1.0.0",
+      "name": "core",
+      "version": "1.0.0",
+      "manifest_path": "crates/core/Cargo.toml"
+    }
+  ],
+  "files": {
+    "path": "Cargo.toml",
+    "kind": "Workspace",
+    "children": [
+      {
+        "path": "crates/app/Cargo.toml",
+        "kind": "Crate",
+        "package_id": "path+file:///repo/crates/app#app@1.0.0",
+        "children": []
+      }
+    ]
+  },
+  "dependencies": {
+    "path+file:///repo/crates/app#app@1.0.0": [
+      "path+file:///repo/crates/core#core@1.0.0"
+    ],
+    "path+file:///repo/crates/core#core@1.0.0": []
+  }
+}
+```
+
+Snapshots are derived artifacts rather than a long-lived interchange format.
+Only schema `1` is accepted; regenerate older or unversioned snapshots with
+`cargo delta snapshot`.
 
 Use `--output PATH` to atomically replace a snapshot file. Without it, snapshot
 JSON is written to stdout as before.
@@ -413,10 +447,10 @@ Using current analysis  : feature.json
   ]
 }
 
-Modified      2 (Crates directly modified by Git changes.)
-Affected      3 (Modified crates plus all their dependents, direct and indirect.)
-Required      4 (Affected crates plus all their dependencies, direct and indirect.)
-Total        15 (Total crates in this workspace.)
+Modified      2 (Packages directly modified by Git changes.)
+Affected      3 (Modified packages plus all their dependents, direct and indirect.)
+Required      4 (Affected packages plus all their dependencies, direct and indirect.)
+Total        15 (Total packages in this workspace.)
 ```
 
 ## Contributing
