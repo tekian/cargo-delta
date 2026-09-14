@@ -151,15 +151,15 @@ cargo delta snapshot -c config.toml # ...
 cargo delta impact -c config.toml # ...
 ```
 
-Configuration options can be set globally and overridden per crate. For example:
+Configuration options can be set globally and overridden per package. For example:
 
 ```toml
 [parser]
 foo = true
 foo_patterns = ["*.foo", "*.bar"]
 
-[parser.my-crate]
-foo_patterns = ["*.baz"] # Override for a specific crate
+[parser.my-package]
+foo_patterns = ["*.baz"] # Override for a specific package
 ```
 
 Default settings are provided in [`config.toml.example`](./config.toml.example).
@@ -323,7 +323,7 @@ For example, a two-package workspace snapshot starts like this:
     "children": [
       {
         "path": "crates/app/Cargo.toml",
-        "kind": "Crate",
+        "kind": "Package",
         "package_id": "path+file:///repo/crates/app#app@1.0.0",
         "children": []
       }

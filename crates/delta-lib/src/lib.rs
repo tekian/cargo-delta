@@ -330,9 +330,9 @@ impl WorkspaceTree {
     }
 }
 
-fn package_identities(workspace_crates: &[&cargo::CargoCrate], git_root: &Path) -> error::Result<Vec<PackageIdentity>> {
-    let mut packages = Vec::with_capacity(workspace_crates.len());
-    for package in workspace_crates {
+fn package_identities(workspace_packages: &[&cargo::CargoPackage], git_root: &Path) -> error::Result<Vec<PackageIdentity>> {
+    let mut packages = Vec::with_capacity(workspace_packages.len());
+    for package in workspace_packages {
         let normalized = package
             .manifest_path
             .normalize()
@@ -409,10 +409,10 @@ fn validate_portable_relative_path(path: &str) -> error::Result<()> {
 
 fn validate_file_tree(node: &FileNode, package_ids: &HashSet<&str>) -> error::Result<()> {
     let _ = portable_relative_path(&node.path)?;
-    if matches!(node.kind, FileKind::Crate) {
+    if matches!(node.kind, FileKind::Package) {
         let package_id = node.package_id.as_deref().ok_or_else(|| {
             error::Error::Other(format!(
-                "Snapshot schema {SNAPSHOT_SCHEMA} crate node '{}' has no package ID",
+                "Snapshot schema {SNAPSHOT_SCHEMA} package node '{}' has no package ID",
                 node.path.display()
             ))
         })?;
@@ -525,9 +525,9 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
     let _ = writeln!(host.error(), "Detected Cargo workspace : {}", workspace_root.display());
     let _ = writeln!(host.error());
 
-    let mut workspace_crates = cargo::get_workspace_crates(&metadata);
-    workspace_crates.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut files = files::build_tree(host, &metadata, &workspace_crates, config);
+    let mut workspace_packages = cargo::get_workspace_packages(&metadata);
+    workspace_packages.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut files = files::build_tree(host, &metadata, &workspace_packages, config);
     let dependencies = match dependencies::parse(&metadata) {
         Ok(dependencies) => dependencies,
         Err(error) => {
@@ -536,7 +536,7 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
             return;
         }
     };
-    let packages = match package_identities(&workspace_crates, &git_root) {
+    let packages = match package_identities(&workspace_packages, &git_root) {
         Ok(packages) => packages,
         Err(error) => {
             let _ = writeln!(host.error(), "Error creating package identities: {error}");
@@ -700,7 +700,7 @@ fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, co
         }
     };
 
-    let result = match get_impacted_crates(host, &baseline_tree, &current_tree, &diff, config) {
+    let result = match get_impacted_packages(host, &baseline_tree, &current_tree, &diff, config) {
         Ok(result) => result,
         Err(error) => {
             let _ = writeln!(host.error(), "Error computing impact: {error}");
@@ -775,7 +775,7 @@ fn emit_result(result: &Impact, workspace: &WorkspaceTree, format: OutputFormat,
                 .join(" ");
             // Empty tier ⇒ emit nothing at all (not even a newline). Otherwise
             // `echo "Impacted: $(...)"` would print a stray trailing space, and
-            // `cargo build $(...)` callers can't easily tell "no crates" from
+            // `cargo build $(...)` callers can't easily tell "no packages" from
             // "blank line". `[ -z "$VAR" ]` then works as expected.
             Ok(with_optional_newline(joined))
         }
@@ -807,7 +807,7 @@ fn emit_result(result: &Impact, workspace: &WorkspaceTree, format: OutputFormat,
 
 /// Union of the selected tiers, deduplicated and sorted. For non-json formats this is what
 /// the user actually wants - listing both `--affected` and `--required` shouldn't print
-/// the same crate twice.
+/// the same package twice.
 #[doc(hidden)]
 fn union_of_tiers(result: &Impact, tiers: TierMask) -> Vec<String> {
     let mut union: HashSet<&String> = HashSet::new();
@@ -870,7 +870,7 @@ fn trip_wire_impact(host: &mut impl Host, current_tree: &WorkspaceTree, git_diff
 }
 
 #[doc(hidden)]
-fn get_impacted_crates(
+fn get_impacted_packages(
     host: &mut impl Host,
     baseline_tree: &WorkspaceTree,
     current_tree: &WorkspaceTree,
@@ -966,15 +966,15 @@ pub(crate) mod test_helpers;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cargo::{CargoCrate, CargoDependency, CargoMetadata, CargoTarget};
+    use crate::cargo::{CargoDependency, CargoMetadata, CargoPackage, CargoTarget};
     use crate::test_helpers::*;
 
     type PackageDef<'a> = (&'a str, &'a str, &'a str, &'a str, &'a [&'a str], &'a [&'a str]);
 
-    fn make_metadata(crate_deps: &[(&str, &[&str])]) -> CargoMetadata {
+    fn make_metadata(package_dependencies: &[(&str, &[&str])]) -> CargoMetadata {
         let mut packages = Vec::new();
-        for (name, deps) in crate_deps {
-            packages.push(CargoCrate {
+        for (name, dependencies) in package_dependencies {
+            packages.push(CargoPackage {
                 id: name.to_string(),
                 name: name.to_string(),
                 version: "0.1.0".to_string(),
@@ -985,7 +985,7 @@ mod tests {
                     src_path: PathBuf::from(format!("{name}/src/lib.rs")),
                 }],
                 manifest_path: PathBuf::from(format!("{name}/Cargo.toml")),
-                dependencies: deps
+                dependencies: dependencies
                     .iter()
                     .map(|dependency| CargoDependency {
                         name: (*dependency).to_string(),
@@ -1004,9 +1004,9 @@ mod tests {
         }
     }
 
-    fn make_file_tree(crate_files: &[(&str, &[&str])]) -> FileNode {
+    fn make_file_tree(package_files: &[(&str, &[&str])]) -> FileNode {
         let mut root = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
-        for (package_id, files) in crate_files {
+        for (package_id, files) in package_files {
             let manifest = PathBuf::from(format!("{package_id}/Cargo.toml"));
             let mut package_node = FileNode::for_package(manifest, (*package_id).to_owned());
             for file in *files {
@@ -1017,12 +1017,12 @@ mod tests {
         root
     }
 
-    fn make_workspace(crate_defs: &[(&str, &[&str], &[&str])]) -> WorkspaceTree {
-        let deps: Vec<(&str, &[&str])> = crate_defs.iter().map(|(n, _, d)| (*n, *d)).collect();
-        let crate_files: Vec<(&str, &[&str])> = crate_defs.iter().map(|(n, f, _)| (*n, *f)).collect();
+    fn make_workspace(package_definitions: &[(&str, &[&str], &[&str])]) -> WorkspaceTree {
+        let dependencies: Vec<(&str, &[&str])> = package_definitions.iter().map(|(name, _, deps)| (*name, *deps)).collect();
+        let package_files: Vec<(&str, &[&str])> = package_definitions.iter().map(|(name, files, _)| (*name, *files)).collect();
 
-        let metadata = make_metadata(&deps);
-        let files = make_file_tree(&crate_files);
+        let metadata = make_metadata(&dependencies);
+        let files = make_file_tree(&package_files);
         let packages = metadata
             .packages
             .iter()
@@ -1055,7 +1055,7 @@ mod tests {
         let metadata = CargoMetadata {
             packages: package_defs
                 .iter()
-                .map(|(id, name, version, manifest_path, _, dependencies)| CargoCrate {
+                .map(|(id, name, version, manifest_path, _, dependencies)| CargoPackage {
                     id: (*id).to_string(),
                     name: (*name).to_string(),
                     version: (*version).to_string(),
@@ -1097,7 +1097,7 @@ mod tests {
         }
     }
 
-    // --- get_impacted_crates tests ---
+    // --- get_impacted_packages tests ---
 
     #[test]
     fn no_changes_produces_empty_impact() {
@@ -1109,7 +1109,7 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_crates(&mut host, &tree, &tree, &diff, &config).unwrap();
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
         assert!(result.modified.is_empty());
         assert!(result.affected.is_empty());
@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_file_marks_crate_modified() {
+    fn changed_file_marks_package_modified() {
         let mut host = TestHost::new();
         let tree = make_workspace(&[("app", &["app/src/main.rs"], &[]), ("lib", &["lib/src/lib.rs"], &[])]);
         let diff = GitDiff {
@@ -1126,7 +1126,7 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_crates(&mut host, &tree, &tree, &diff, &config).unwrap();
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
         assert!(result.modified.contains("lib"));
         assert!(!result.modified.contains("app"));
@@ -1142,7 +1142,7 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_crates(&mut host, &tree, &tree, &diff, &config).unwrap();
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
         assert!(result.modified.contains("lib"));
         assert!(result.affected.contains("lib"));
@@ -1164,7 +1164,7 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_crates(&mut host, &tree, &tree, &diff, &config).unwrap();
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
         assert!(result.modified.contains("middleware"));
         assert!(result.affected.contains("app"));
@@ -1175,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_file_marks_crate_modified() {
+    fn deleted_file_marks_package_modified() {
         let mut host = TestHost::new();
         let baseline = make_workspace(&[("lib", &["lib/src/lib.rs", "lib/src/old.rs"], &[])]);
         let current = make_workspace(&[("lib", &["lib/src/lib.rs"], &[])]);
@@ -1185,13 +1185,13 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_crates(&mut host, &baseline, &current, &diff, &config).unwrap();
+        let result = get_impacted_packages(&mut host, &baseline, &current, &diff, &config).unwrap();
 
         assert!(result.modified.contains("lib"));
     }
 
     #[test]
-    fn new_file_in_branch_marks_crate_modified() {
+    fn new_file_in_branch_marks_package_modified() {
         let mut host = TestHost::new();
         let baseline = make_workspace(&[("lib", &["lib/src/lib.rs"], &[])]);
         let current = make_workspace(&[("lib", &["lib/src/lib.rs", "lib/src/new.rs"], &[])]);
@@ -1201,7 +1201,7 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_crates(&mut host, &baseline, &current, &diff, &config).unwrap();
+        let result = get_impacted_packages(&mut host, &baseline, &current, &diff, &config).unwrap();
 
         assert!(result.modified.contains("lib"));
     }
@@ -1233,7 +1233,7 @@ mod tests {
             deleted: Vec::new(),
         };
 
-        let result = get_impacted_crates(&mut TestHost::new(), &tree, &tree, &diff, &MainConfig::default()).unwrap();
+        let result = get_impacted_packages(&mut TestHost::new(), &tree, &tree, &diff, &MainConfig::default()).unwrap();
 
         assert_eq!(result.modified, HashSet::from([LIB_ID.to_string()]));
         assert_eq!(result.affected, HashSet::from([LIB_ID.to_string(), APP_ID.to_string()]));
@@ -1254,7 +1254,7 @@ mod tests {
             deleted: vec![PathBuf::from("lib/src/lib.rs")],
         };
 
-        let result = get_impacted_crates(&mut TestHost::new(), &baseline, &current, &diff, &MainConfig::default()).unwrap();
+        let result = get_impacted_packages(&mut TestHost::new(), &baseline, &current, &diff, &MainConfig::default()).unwrap();
 
         assert!(result.modified.is_empty());
         assert_eq!(result.affected, HashSet::from([CURRENT_APP.to_string()]));
@@ -1262,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn trip_wire_activated_returns_all_crates() {
+    fn trip_wire_activated_returns_all_packages() {
         let mut host = TestHost::new();
         let tree = make_workspace(&[("app", &["app/src/main.rs"], &[]), ("lib", &["lib/src/lib.rs"], &[])]);
         let diff = GitDiff {
@@ -1274,7 +1274,7 @@ mod tests {
             ..MainConfig::default()
         };
 
-        let result = get_impacted_crates(&mut host, &tree, &tree, &diff, &config).unwrap();
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
         assert!(result.modified.contains("app"));
         assert!(result.modified.contains("lib"));
@@ -1296,7 +1296,7 @@ mod tests {
             ..MainConfig::default()
         };
 
-        let result = get_impacted_crates(&mut host, &tree, &tree, &diff, &config).unwrap();
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
         assert!(result.modified.contains("lib"));
         assert!(host.stderr_str().contains("no matching files were found"));
@@ -1315,7 +1315,7 @@ mod tests {
             ..MainConfig::default()
         };
 
-        let result = get_impacted_crates(&mut host, &tree, &tree, &diff, &config).unwrap();
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
         assert!(result.modified.contains("app"));
         assert!(host.stderr_str().contains("Trip wire activated"));
@@ -1332,7 +1332,7 @@ mod tests {
     }
 
     fn sample_workspace_names() -> Vec<String> {
-        // A workspace of 5 crates; impact above touches a/b/c, leaves d/e untouched.
+        // A workspace of 5 packages; impact above touches a/b/c, leaves d/e untouched.
         ["a", "b", "c", "d", "e"].into_iter().map(String::from).collect()
     }
 
@@ -1764,14 +1764,18 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn snapshot_output_matches_stdout_and_contains_canonical_identity() {
         let directory = test_directory("snapshot-output");
-        let crate_directory = directory.join("portable");
-        std::fs::create_dir_all(crate_directory.join("src")).unwrap();
-        std::fs::write(crate_directory.join("Cargo.toml"), "[package]\nname='portable'\nversion='1.2.3'\n").unwrap();
-        std::fs::write(crate_directory.join("src").join("lib.rs"), "pub fn portable() {}\n").unwrap();
+        let package_directory = directory.join("portable");
+        std::fs::create_dir_all(package_directory.join("src")).unwrap();
+        std::fs::write(
+            package_directory.join("Cargo.toml"),
+            "[package]\nname='portable'\nversion='1.2.3'\n",
+        )
+        .unwrap();
+        std::fs::write(package_directory.join("src").join("lib.rs"), "pub fn portable() {}\n").unwrap();
 
         let package_id = "path+file:///repo/portable#portable@1.2.3";
         let metadata = CargoMetadata {
-            packages: vec![CargoCrate {
+            packages: vec![CargoPackage {
                 id: package_id.to_string(),
                 name: "portable".to_string(),
                 version: "1.2.3".to_string(),
@@ -1779,9 +1783,9 @@ mod tests {
                 targets: vec![CargoTarget {
                     name: "renamed_library".to_string(),
                     kind: vec!["lib".to_string()],
-                    src_path: crate_directory.join("src").join("lib.rs"),
+                    src_path: package_directory.join("src").join("lib.rs"),
                 }],
-                manifest_path: crate_directory.join("Cargo.toml"),
+                manifest_path: package_directory.join("Cargo.toml"),
                 dependencies: Vec::new(),
             }],
             workspace_members: vec![package_id.to_string()],

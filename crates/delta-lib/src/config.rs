@@ -17,7 +17,7 @@ pub struct MainConfig {
     #[serde(default)]
     pub trip_wire_patterns: Vec<String>,
     #[serde(flatten)]
-    pub crate_configs: HashMap<String, ParserConfig>,
+    pub package_configs: HashMap<String, ParserConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,9 +88,12 @@ impl Default for MainConfig {
 }
 
 impl MainConfig {
-    pub fn crate_config(&self, crate_name: &str) -> ParserConfig {
-        let crate_key = format!("parser.{crate_name}");
-        self.crate_configs.get(&crate_key).cloned().unwrap_or_else(|| self.parser.clone())
+    pub fn package_config(&self, package_name: &str) -> ParserConfig {
+        let package_key = format!("parser.{package_name}");
+        self.package_configs
+            .get(&package_key)
+            .cloned()
+            .unwrap_or_else(|| self.parser.clone())
     }
 }
 
@@ -136,9 +139,9 @@ mod tests {
     }
 
     #[test]
-    fn crate_config_returns_default_parser_when_no_override() {
+    fn package_config_returns_default_parser_when_no_override() {
         let config = MainConfig::default();
-        let parser = config.crate_config("some-crate");
+        let parser = config.package_config("some-package");
         assert!(parser.file_refs);
         assert!(parser.mods);
     }
