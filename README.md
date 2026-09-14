@@ -58,8 +58,9 @@ cargo install cargo-delta
    cargo delta impact --baseline main.json --current feature.json
    ```
 
-   The same low-level workflow can write portable artifacts without shell
-   redirection:
+   By default, both commands write their machine-readable JSON to stdout. Use
+   `--output PATH` to atomically write each result to a file instead of relying
+   on shell redirection:
 
    ```bash
    git checkout main
