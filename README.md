@@ -94,32 +94,6 @@ paths are managed externally:
    cargo delta impact --baseline main.json --current feature.json
    ```
 
-   By default, both commands write their machine-readable JSON to stdout. Use
-   `--output PATH` to atomically write each result to a file instead of relying
-   on shell redirection:
-
-   ```bash
-   git checkout main
-   cargo delta snapshot --output main.json
-
-   git checkout feature-branch
-   cargo delta snapshot --output feature.json
-
-   cargo delta impact \
-     --baseline main.json \
-     --current feature.json \
-     --base-ref origin/main \
-     --affected \
-     --format packages \
-     --output affected.packages
-   ```
-
-   `affected.packages` contains one sorted `name@version` Cargo package spec per
-   line. If the selection is empty, the file is still created and has zero
-   bytes. `--changed-files PATH` can replace `--base-ref` when CI already has an
-   authoritative UTF-8 JSON change manifest with `changed` and `deleted`
-   arrays; the two options are mutually exclusive.
-
    By default this prints the full `Impact` JSON with all three tiers. Use the
    tier toggles (`--modified`, `--affected`, `--required`) to filter — when none
    are given, all three are included (back-compat). To plug the result straight
@@ -128,9 +102,6 @@ paths are managed externally:
    ```bash
    # One bare package name per line — good for xargs / shell loops.
    cargo delta impact --baseline main.json --current feature.json -f names --affected
-
-   # One unambiguous Cargo package spec per line.
-   cargo delta impact --baseline main.json --current feature.json -f packages --affected
 
    # `-p NAME` pairs — drop into any cargo invocation via $(...).
    cargo build $(cargo delta impact --baseline main.json --current feature.json -f cargo-args --affected)
@@ -217,15 +188,15 @@ cargo delta snapshot -c config.toml # ...
 cargo delta impact -c config.toml # ...
 ```
 
-Configuration options can be set globally and overridden per crate. For example:
+Configuration options can be set globally and overridden per package. For example:
 
 ```toml
 [parser]
 foo = true
 foo_patterns = ["*.foo", "*.bar"]
 
-[parser.my-crate]
-foo_patterns = ["*.baz"] # Override for a specific crate
+[parser.my-package]
+foo_patterns = ["*.baz"] # Override for a specific package
 ```
 
 Default settings are provided in [`config.toml.example`](./config.toml.example).
@@ -389,7 +360,7 @@ For example, a two-package workspace snapshot starts like this:
     "children": [
       {
         "path": "crates/app/Cargo.toml",
-        "kind": "Crate",
+        "kind": "Package",
         "package_id": "path+file:///repo/crates/app#app@1.0.0",
         "children": []
       }
@@ -411,6 +382,10 @@ Only schema `1` is accepted; regenerate older or unversioned snapshots with
 Use `--output PATH` to atomically replace a snapshot file. Without it, snapshot
 JSON is written to stdout as before.
 
+```bash
+cargo delta snapshot --output snapshot.json
+```
+
 ### Impact
 
 `cargo delta impact` compares two snapshots plus the Git change set and reports
@@ -423,6 +398,20 @@ which workspace packages are impacted.
 Use `--base-ref REF` for an explicit merge-base comparison, or
 `--changed-files PATH` to supply `{"changed":[],"deleted":[]}` paths directly.
 Use `--output PATH` to atomically write any format instead of stdout.
+
+```bash
+# Compare the snapshots using changes from merge-base(HEAD, origin/main)..HEAD.
+cargo delta impact \
+  --baseline main.json \
+  --current feature.json \
+  --base-ref origin/main
+
+# Or use a change manifest supplied by the CI system.
+cargo delta impact \
+  --baseline main.json \
+  --current feature.json \
+  --changed-files changes.json
+```
 
 ### Impact output formats
 
@@ -442,6 +431,17 @@ format, selecting multiple tiers emits their sorted, deduplicated union.
 selection. `cargo-excludes` instead lists the whole workspace when the
 selection is empty, and produces zero bytes when the selection already covers
 the whole workspace.
+
+For example, write the affected set as unambiguous Cargo package specs:
+
+```bash
+cargo delta impact \
+  --baseline main.json \
+  --current feature.json \
+  --affected \
+  --format packages \
+  --output affected.packages
+```
 
 Alternatively, pair `--base-ref REF` with `--output-dir DIR` and omit
 `--baseline`/`--current` to generate both exact-commit snapshots, all tier

@@ -7,14 +7,14 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CargoMetadata {
-    pub packages: Vec<CargoCrate>,
+    pub packages: Vec<CargoPackage>,
     pub workspace_members: Vec<String>,
     pub workspace_root: PathBuf,
     pub target_directory: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CargoCrate {
+pub struct CargoPackage {
     pub id: String,
     pub name: String,
     pub version: String,
@@ -60,7 +60,7 @@ pub fn metadata(host: &mut impl Host, working_dir: Option<&std::path::Path>) -> 
     Ok(metadata)
 }
 
-pub fn get_workspace_crates(metadata: &CargoMetadata) -> Vec<&CargoCrate> {
+pub fn get_workspace_packages(metadata: &CargoMetadata) -> Vec<&CargoPackage> {
     let members: HashSet<&str> = metadata.workspace_members.iter().map(String::as_str).collect();
     metadata.packages.iter().filter(|pkg| members.contains(pkg.id.as_str())).collect()
 }
@@ -125,10 +125,10 @@ mod tests {
     }
 
     #[test]
-    fn get_workspace_crates_filters_external_packages() {
+    fn get_workspace_packages_filters_external_packages() {
         let meta = CargoMetadata {
             packages: vec![
-                CargoCrate {
+                CargoPackage {
                     id: "path+file:///repo/local#0.1.0".to_string(),
                     name: "local".to_string(),
                     version: "0.1.0".to_string(),
@@ -137,7 +137,7 @@ mod tests {
                     manifest_path: PathBuf::from("Cargo.toml"),
                     dependencies: vec![],
                 },
-                CargoCrate {
+                CargoPackage {
                     id: "registry+https://github.com/rust-lang/crates.io-index#external@1.0.0".to_string(),
                     name: "external".to_string(),
                     version: "1.0.0".to_string(),
@@ -152,7 +152,7 @@ mod tests {
             target_directory: PathBuf::from("target"),
         };
 
-        let result = get_workspace_crates(&meta);
+        let result = get_workspace_packages(&meta);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "local");
     }

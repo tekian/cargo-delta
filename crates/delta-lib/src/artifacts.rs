@@ -172,7 +172,7 @@ fn generate(host: &mut impl Host, config: &MainConfig, base_ref: &str, output_di
     let impact = if widened {
         all_packages_impact(&current.tree)
     } else {
-        crate::get_impacted_crates(host, &baseline.tree, &current.tree, &ref_context.diff, config)?
+        crate::get_impacted_packages(host, &baseline.tree, &current.tree, &ref_context.diff, config)?
     };
     let dirty_policy_name = match dirty_policy {
         DirtyPolicy::Error => "error",

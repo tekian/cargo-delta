@@ -56,7 +56,7 @@ pub fn parse(metadata: &CargoMetadata) -> Result<PackageDependencies> {
     Ok(PackageDependencies { dependencies })
 }
 
-fn dependency_matches(dependency_path: Option<&Path>, dependency_name: &str, package: &crate::cargo::CargoCrate) -> bool {
+fn dependency_matches(dependency_path: Option<&Path>, dependency_name: &str, package: &crate::cargo::CargoPackage) -> bool {
     if let Some(dependency_path) = dependency_path {
         let Some(package_directory) = package.manifest_path.parent() else {
             return false;
@@ -106,13 +106,13 @@ impl PackageDependencies {
         let mut to_visit = vec![package_id.to_string()];
         let mut visited = HashSet::new();
 
-        while let Some(current_crate) = to_visit.pop() {
-            if visited.contains(&current_crate) {
+        while let Some(current_package) = to_visit.pop() {
+            if visited.contains(&current_package) {
                 continue;
             }
-            let _ = visited.insert(current_crate.clone());
+            let _ = visited.insert(current_package.clone());
 
-            if let Some(dependencies) = self.get_dependencies(&current_crate) {
+            if let Some(dependencies) = self.get_dependencies(&current_package) {
                 for dependency in dependencies {
                     if all_dependencies.insert(dependency.clone()) {
                         to_visit.push(dependency.clone());
@@ -133,13 +133,13 @@ impl PackageDependencies {
         let mut to_visit = vec![package_id.to_string()];
         let mut visited = HashSet::new();
 
-        while let Some(current_crate) = to_visit.pop() {
-            if visited.contains(&current_crate) {
+        while let Some(current_package) = to_visit.pop() {
+            if visited.contains(&current_package) {
                 continue;
             }
-            let _ = visited.insert(current_crate.clone());
+            let _ = visited.insert(current_package.clone());
 
-            if let Some(dependents) = self.get_dependents(&current_crate) {
+            if let Some(dependents) = self.get_dependents(&current_package) {
                 for dependent in dependents {
                     if all_dependents.insert(dependent.clone()) {
                         to_visit.push(dependent.clone());

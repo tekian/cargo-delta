@@ -55,7 +55,8 @@ Snapshot schema 1 contains:
 The ID is Cargo's package ID. Manifest and file paths are Git-root-relative and
 serialize with `/` separators. File ownership and workspace dependency edges
 reference package IDs; package names and target names are not used as graph
-identity.
+identity. A package-root manifest has file kind `Package`; the Rust crate
+targets built by that package have file kind `Target`.
 
 Snapshots are derived cache artifacts. The reader accepts only schema 1;
 unversioned cargo-delta 0.3 snapshots and unknown future schemas fail with
