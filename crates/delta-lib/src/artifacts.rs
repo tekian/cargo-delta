@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cargo::CargoMetadata;
 use crate::config::MainConfig;
-use crate::crates::Crates;
+use crate::dependencies::PackageDependencies;
 use crate::error::{Error, Result};
 use crate::files::{FileKind, FileNode};
 use crate::git::RefContext;
@@ -571,7 +571,7 @@ fn empty_snapshot(workspace_relative: &Path) -> Result<WorkspaceTree> {
         schema: SNAPSHOT_SCHEMA,
         packages: Vec::new(),
         files: FileNode::new(workspace_relative.join("Cargo.toml"), FileKind::Workspace),
-        crates: Crates::empty(),
+        dependencies: PackageDependencies::empty(),
     };
     tree.validate()?;
     Ok(tree)
@@ -665,7 +665,7 @@ fn unique_worktree_path(parent: &Path) -> Result<PathBuf> {
 }
 
 fn all_packages_impact(current: &WorkspaceTree) -> Impact {
-    let packages: HashSet<String> = current.crates.get_all_package_ids().into_iter().collect();
+    let packages: HashSet<String> = current.dependencies.get_all_package_ids().into_iter().collect();
     Impact {
         modified: packages.clone(),
         affected: packages.clone(),
