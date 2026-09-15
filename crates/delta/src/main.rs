@@ -1,6 +1,6 @@
 #![doc(hidden)]
 
-//! A cargo tool to detect impacted crates from git changes.
+//! A cargo tool to detect impacted packages from git changes.
 
 use cargo_delta_lib::Host;
 use std::io::{self, Write, stderr, stdout};

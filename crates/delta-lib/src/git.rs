@@ -27,8 +27,10 @@ impl GitBranch<'_> {
     }
 }
 
-pub fn diff(host: &mut impl Host, workspace_path: &Path, config: Option<&GitConfig>) -> Result<GitDiff> {
-    let remote_branch = if let Some(b) = config.and_then(|d| d.remote_branch.as_deref()) {
+pub fn diff(host: &mut impl Host, workspace_path: &Path, config: Option<&GitConfig>, base_ref: Option<&str>) -> Result<GitDiff> {
+    let remote_branch = if let Some(base_ref) = base_ref {
+        GitBranch::Feature(Cow::Borrowed(base_ref))
+    } else if let Some(b) = config.and_then(|d| d.remote_branch.as_deref()) {
         GitBranch::Feature(Cow::Borrowed(b))
     } else {
         let main_branch = best_effort_main_branch(host, workspace_path)?;
@@ -225,13 +227,27 @@ mod tests {
             Ok(success_output("src/lib.rs\n")), // diff
         ]);
 
-        let result = diff(&mut host, &tmp, Some(&git_config)).unwrap();
+        let result = diff(&mut host, &tmp, Some(&git_config), None).unwrap();
 
         assert_eq!(result.changed.len(), 1);
         assert!(result.deleted.is_empty());
         // No "No remote branch" message since branch was configured
         assert!(!host.stderr_str().contains("No remote branch"));
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn diff_with_explicit_base_ref_skips_discovery() {
+        let tmp = std::env::temp_dir().join("cargo_delta_test_diff_base_ref");
+        let _ = std::fs::create_dir_all(&tmp);
+        let mut host = TestHost::new().with_commands(vec![Ok(success_output("abc123\n")), Ok(success_output(""))]);
+
+        let result = diff(&mut host, &tmp, None, Some("origin/explicit")).unwrap();
+
+        assert!(result.changed.is_empty());
+        assert!(!host.stderr_str().contains("No remote branch specified"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -247,7 +263,7 @@ mod tests {
 
         let mut host = TestHost::new().with_commands(vec![Ok(failure_output("fatal: not a valid commit"))]);
 
-        let result = diff(&mut host, &tmp, Some(&git_config));
+        let result = diff(&mut host, &tmp, Some(&git_config), None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("merge-base"));
 
