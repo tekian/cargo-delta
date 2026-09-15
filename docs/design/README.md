@@ -19,6 +19,14 @@ identify three package sets:
 The tool computes selections and writes artifacts. It does not run build, test,
 lint, or other user commands.
 
+## Cargo subprocess selection
+
+When cargo-delta needs workspace metadata, it invokes the non-empty `CARGO`
+environment value that Cargo provides to external subcommands. This preserves
+the caller's Cargo executable and its toolchain multiplexer. When cargo-delta is
+launched directly without `CARGO`, it falls back to resolving `cargo` through
+the operating system. It does not rewrite toolchain environment variables.
+
 ## Snapshot command
 
 ```text

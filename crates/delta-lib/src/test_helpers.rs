@@ -1,5 +1,6 @@
 use crate::host::Host;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Output;
@@ -18,6 +19,7 @@ pub struct TestHost {
     pub command_calls: Vec<CommandCall>,
     current_dir: std::path::PathBuf,
     command_responses: VecDeque<io::Result<Output>>,
+    env_vars: HashMap<String, OsString>,
 }
 
 impl TestHost {
@@ -29,11 +31,17 @@ impl TestHost {
             command_calls: Vec::new(),
             current_dir: std::env::current_dir().expect("tests require a current working directory"),
             command_responses: VecDeque::new(),
+            env_vars: HashMap::new(),
         }
     }
 
     pub fn with_commands(mut self, responses: Vec<io::Result<Output>>) -> Self {
         self.command_responses = VecDeque::from(responses);
+        self
+    }
+
+    pub fn with_env_var(mut self, key: impl Into<String>, value: impl Into<OsString>) -> Self {
+        let _ = self.env_vars.insert(key.into(), value.into());
         self
     }
 
@@ -63,9 +71,13 @@ impl Host for TestHost {
         Ok(self.current_dir.clone())
     }
 
-    fn run_command(&mut self, command: &str, args: &[&str], working_dir: Option<&Path>) -> io::Result<Output> {
+    fn env_var_os(&self, key: &str) -> Option<OsString> {
+        self.env_vars.get(key).cloned()
+    }
+
+    fn run_command(&mut self, command: impl AsRef<OsStr>, args: &[&str], working_dir: Option<&Path>) -> io::Result<Output> {
         self.command_calls.push(CommandCall {
-            command: command.to_string(),
+            command: command.as_ref().to_string_lossy().into_owned(),
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
             working_dir: working_dir.map(Path::to_path_buf),
         });
