@@ -16,17 +16,17 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::MainConfig;
+use crate::crates::{PackageId, Packages, package_name};
 use crate::files::FileNode;
 use crate::git::GitDiff;
-use crate::packages::{PackageId, Packages, package_name};
 
 mod cargo;
 mod config;
+mod crates;
 mod error;
 mod files;
 mod git;
 mod host;
-mod packages;
 mod utils;
 
 pub use host::Host;
@@ -241,7 +241,7 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
 
     let packages = cargo::get_workspace_packages(&metadata);
     let mut files = files::build_tree(host, &metadata, &packages, config);
-    let packages = packages::parse(&metadata);
+    let packages = crates::parse(&metadata);
 
     files.make_relative_paths(&git_root);
 
@@ -642,8 +642,8 @@ pub(crate) mod test_helpers;
 mod tests {
     use super::*;
     use crate::cargo::{CargoDependency, CargoMetadata, CargoPackage, CargoTarget};
+    use crate::crates::package_id;
     use crate::files::FileKind;
-    use crate::packages::package_id;
     use crate::test_helpers::*;
 
     fn id(name: &str) -> PackageId {
@@ -698,7 +698,7 @@ mod tests {
 
         let metadata = make_metadata(&deps);
         let files = make_file_tree(&package_files);
-        let packages = packages::parse(&metadata);
+        let packages = crates::parse(&metadata);
 
         WorkspaceTree { files, packages }
     }

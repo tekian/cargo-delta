@@ -1,3 +1,5 @@
+//! Cargo package dependency graph.
+
 use crate::cargo::CargoMetadata;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

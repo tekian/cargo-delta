@@ -10,9 +10,9 @@ use syn::visit::Visit;
 use crate::{
     cargo::{CargoMetadata, CargoPackage},
     config::{MainConfig, ParserConfig},
+    crates::{PackageId, package_id},
     error::Result,
     host::Host,
-    packages::{PackageId, package_id},
     utils,
 };
 
