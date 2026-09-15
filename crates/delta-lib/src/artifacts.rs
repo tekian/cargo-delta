@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 
 use crate::cargo::CargoMetadata;
 use crate::config::MainConfig;
-use crate::dependencies::PackageDependencies;
 use crate::error::{Error, Result};
 use crate::files::{FileKind, FileNode};
 use crate::git::RefContext;
 use crate::host::Host;
+use crate::packages::Packages;
 use crate::{DirtyPolicy, Impact, SNAPSHOT_SCHEMA, WorkspaceTree};
 
 const ARTIFACT_SCHEMA: u32 = 1;
@@ -172,7 +172,7 @@ fn generate(host: &mut impl Host, config: &MainConfig, base_ref: &str, output_di
     let impact = if widened {
         all_packages_impact(&current.tree)
     } else {
-        crate::get_impacted_packages(host, &baseline.tree, &current.tree, &ref_context.diff, config)?
+        crate::get_impacted_packages(host, &baseline.tree, &current.tree, &ref_context.diff, config)
     };
     let dirty_policy_name = match dirty_policy {
         DirtyPolicy::Error => "error",
@@ -569,9 +569,8 @@ fn finish_snapshot(snapshot_result: Result<SnapshotArtifact>, cleanup_result: Re
 fn empty_snapshot(workspace_relative: &Path) -> Result<WorkspaceTree> {
     let tree = WorkspaceTree {
         schema: SNAPSHOT_SCHEMA,
-        packages: Vec::new(),
         files: FileNode::new(workspace_relative.join("Cargo.toml"), FileKind::Workspace),
-        dependencies: PackageDependencies::empty(),
+        packages: Packages::default(),
     };
     tree.validate()?;
     Ok(tree)
@@ -665,7 +664,7 @@ fn unique_worktree_path(parent: &Path) -> Result<PathBuf> {
 }
 
 fn all_packages_impact(current: &WorkspaceTree) -> Impact {
-    let packages: HashSet<String> = current.dependencies.get_all_package_manifests().into_iter().collect();
+    let packages = current.packages.get_all().into_iter().collect::<HashSet<_>>();
     Impact {
         modified: packages.clone(),
         affected: packages.clone(),
@@ -684,9 +683,9 @@ fn render_artifacts(impact: &Impact, baseline: &SnapshotArtifact, current: &Snap
             crate::TierMask::resolve(false, false, false),
         )?,
     );
-    let _ = artifacts.insert(MODIFIED_FILE, crate::lines(&current.tree.package_specs(&impact.modified)?));
-    let _ = artifacts.insert(AFFECTED_FILE, crate::lines(&current.tree.package_specs(&impact.affected)?));
-    let _ = artifacts.insert(REQUIRED_FILE, crate::lines(&current.tree.package_specs(&impact.required)?));
+    let _ = artifacts.insert(MODIFIED_FILE, crate::lines(&current.tree.packages.specs(&impact.modified)?));
+    let _ = artifacts.insert(AFFECTED_FILE, crate::lines(&current.tree.packages.specs(&impact.affected)?));
+    let _ = artifacts.insert(REQUIRED_FILE, crate::lines(&current.tree.packages.specs(&impact.required)?));
     let _ = artifacts.insert(BASELINE_SNAPSHOT_FILE, baseline.bytes.clone());
     let _ = artifacts.insert(CURRENT_SNAPSHOT_FILE, current.bytes.clone());
     Ok(artifacts)
@@ -955,10 +954,9 @@ mod tests {
             assert_eq!(u64::try_from(bytes.len()).unwrap(), expected.bytes);
         }
         let current: serde_json::Value = serde_json::from_slice(&fs::read(output_dir.join(CURRENT_SNAPSHOT_FILE)).unwrap()).unwrap();
-        for package in current["packages"].as_array().unwrap() {
-            let manifest_path = package["manifest_path"].as_str().unwrap();
-            assert!(!manifest_path.contains('\\'));
-            assert!(!manifest_path.starts_with('/'));
+        for package_id in current["packages"].as_object().unwrap().keys() {
+            assert!(package_id.contains('@'));
+            assert!(!package_id.contains(['/', '\\']));
         }
         assert_worktrees_clean(&root);
         assert!(git(&root, &["status", "--porcelain"]).contains("artifacts"));
@@ -1075,7 +1073,7 @@ mod tests {
         assert!(manifest.widened);
         assert!(!manifest.baseline_workspace);
         let baseline: WorkspaceTree = serde_json::from_slice(&fs::read(output_dir.join(BASELINE_SNAPSHOT_FILE)).unwrap()).unwrap();
-        assert!(baseline.packages.is_empty());
+        assert_eq!(baseline.packages.len(), 0);
         assert_eq!(fs::read(output_dir.join(MODIFIED_FILE)).unwrap(), b"app@1.0.0\ncore-lib@1.0.0\n");
         assert_worktrees_clean(&root);
         fs::remove_dir_all(root).unwrap();
