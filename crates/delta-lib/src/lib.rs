@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use normpath::PathExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -182,14 +182,13 @@ struct Impact {
 struct WorkspaceTree {
     #[serde(default)]
     pub schema: u32,
-    pub packages: Vec<PackageIdentity>,
+    pub packages: Vec<SnapshotPackage>,
     pub files: FileNode,
     pub dependencies: PackageDependencies,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PackageIdentity {
-    id: String,
+struct SnapshotPackage {
     name: String,
     version: String,
     manifest_path: String,
@@ -206,13 +205,14 @@ impl WorkspaceTree {
             )));
         }
 
-        let mut package_ids = HashSet::new();
+        let mut package_manifests = HashSet::new();
         let mut package_specs = HashSet::new();
         for package in &self.packages {
-            if !package_ids.insert(package.id.as_str()) {
+            validate_portable_relative_path(&package.manifest_path)?;
+            if !package_manifests.insert(package.manifest_path.as_str()) {
                 return Err(error::Error::Other(format!(
-                    "Snapshot schema {SNAPSHOT_SCHEMA} contains duplicate package ID '{}'",
-                    package.id
+                    "Snapshot schema {SNAPSHOT_SCHEMA} contains duplicate package manifest '{}'",
+                    package.manifest_path
                 )));
             }
             let spec = format!("{}@{}", package.name, package.version);
@@ -221,135 +221,80 @@ impl WorkspaceTree {
                     "Snapshot schema {SNAPSHOT_SCHEMA} contains ambiguous package spec '{spec}'"
                 )));
             }
-            validate_portable_relative_path(&package.manifest_path)?;
         }
 
-        for package_id in self.dependencies.get_all_package_ids() {
-            if !package_ids.contains(package_id.as_str()) {
+        for package_manifest in self.dependencies.get_all_package_manifests() {
+            if !package_manifests.contains(package_manifest.as_str()) {
                 return Err(error::Error::Other(format!(
-                    "Snapshot dependency graph refers to unknown package ID '{package_id}'"
+                    "Snapshot dependency graph refers to unknown package manifest '{package_manifest}'"
                 )));
             }
-            for dependency_id in self.dependencies.get_dependencies(&package_id).into_iter().flatten() {
-                if !package_ids.contains(dependency_id.as_str()) {
+            for dependency_manifest in self.dependencies.get_dependencies(&package_manifest).into_iter().flatten() {
+                if !package_manifests.contains(dependency_manifest.as_str()) {
                     return Err(error::Error::Other(format!(
-                        "Snapshot dependency graph refers to unknown dependency package ID '{dependency_id}'"
+                        "Snapshot dependency graph refers to unknown dependency package manifest '{dependency_manifest}'"
                     )));
                 }
             }
         }
-        if package_ids.len() != self.dependencies.len() {
+        if package_manifests.len() != self.dependencies.len() {
             return Err(error::Error::Other(
                 "Snapshot package identities and dependency graph contain different workspace members".to_string(),
             ));
         }
-        validate_file_tree(&self.files, &package_ids)?;
+        validate_file_tree(&self.files, &package_manifests)?;
         Ok(())
     }
 
-    fn package_names(&self, package_ids: &HashSet<String>) -> error::Result<Vec<String>> {
-        let mut names = HashSet::new();
-        for package_id in package_ids {
-            let _ = names.insert(self.package_name(package_id)?);
-        }
-        let mut names: Vec<String> = names.into_iter().collect();
+    fn package_names(&self, package_manifests: &HashSet<String>) -> error::Result<Vec<String>> {
+        let mut names: Vec<String> = self
+            .selected_packages(package_manifests)?
+            .into_iter()
+            .map(|package| package.name.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         names.sort();
         Ok(names)
     }
 
-    fn package_specs(&self, package_ids: &HashSet<String>) -> error::Result<Vec<String>> {
-        let mut specs_to_ids: HashMap<String, Vec<&str>> = HashMap::new();
-        for package in &self.packages {
-            specs_to_ids
-                .entry(format!("{}@{}", package.name, package.version))
-                .or_default()
-                .push(package.id.as_str());
-        }
-        if let Some((spec, ids)) = specs_to_ids.iter().find(|(_, ids)| ids.len() > 1) {
-            return Err(error::Error::Other(format!(
-                "Current workspace contains ambiguous package spec '{spec}' for package IDs: {}",
-                ids.join(", ")
-            )));
-        }
+    fn package_specs(&self, package_manifests: &HashSet<String>) -> error::Result<Vec<String>> {
+        Ok(self
+            .selected_packages(package_manifests)?
+            .into_iter()
+            .map(|package| format!("{}@{}", package.name, package.version))
+            .collect())
+    }
 
-        let mut packages = Vec::new();
-        for package_id in package_ids {
-            let package = self.package_by_id(package_id).ok_or_else(|| {
-                error::Error::Other(format!(
-                    "Impact result package ID '{package_id}' does not map to exactly one current package"
-                ))
-            })?;
-            packages.push(package);
-        }
+    fn selected_packages(&self, package_manifests: &HashSet<String>) -> error::Result<Vec<&SnapshotPackage>> {
+        let mut packages = package_manifests
+            .iter()
+            .map(|package_manifest| {
+                self.package_by_manifest(package_manifest)
+                    .ok_or_else(|| error::Error::Other(format!("Impact result refers to unknown package manifest '{package_manifest}'")))
+            })
+            .collect::<error::Result<Vec<_>>>()?;
         packages.sort_by(|left, right| {
             left.name
                 .cmp(&right.name)
                 .then_with(|| left.version.cmp(&right.version))
                 .then_with(|| left.manifest_path.cmp(&right.manifest_path))
         });
-        Ok(packages
-            .into_iter()
-            .map(|package| format!("{}@{}", package.name, package.version))
-            .collect())
+        Ok(packages)
     }
 
-    fn package_name(&self, package_id: &str) -> error::Result<String> {
-        self.package_by_id(package_id).map(|package| package.name.clone()).ok_or_else(|| {
-            error::Error::Other(format!(
-                "Impact result package ID '{package_id}' does not map to exactly one current package"
-            ))
-        })
-    }
-
-    fn package_by_id(&self, package_id: &str) -> Option<&PackageIdentity> {
-        self.packages.iter().find(|package| package.id == package_id)
-    }
-
-    fn current_id_for(&self, source: &Self, source_id: &str) -> error::Result<Option<String>> {
-        let source_package = source
-            .package_by_id(source_id)
-            .ok_or_else(|| error::Error::Other(format!("Snapshot file ownership refers to unknown package ID '{source_id}'")))?;
-
-        let matches: Vec<&PackageIdentity> = self
-            .packages
-            .iter()
-            .filter(|candidate| {
-                candidate.name == source_package.name
-                    && candidate.version == source_package.version
-                    && candidate.manifest_path == source_package.manifest_path
-            })
-            .collect();
-        match matches.as_slice() {
-            [] => Ok(None),
-            [package] => Ok(Some(package.id.clone())),
-            _ => Err(error::Error::Other(format!(
-                "Package '{}@{}' at '{}' does not map to exactly one current package identity",
-                source_package.name, source_package.version, source_package.manifest_path
-            ))),
-        }
+    fn package_by_manifest(&self, package_manifest: &str) -> Option<&SnapshotPackage> {
+        self.packages.iter().find(|package| package.manifest_path == package_manifest)
     }
 }
 
-fn package_identities(workspace_packages: &[&cargo::CargoPackage], git_root: &Path) -> error::Result<Vec<PackageIdentity>> {
+fn snapshot_packages(workspace_packages: &[&cargo::CargoPackage], git_root: &Path) -> error::Result<Vec<SnapshotPackage>> {
     let mut packages = Vec::with_capacity(workspace_packages.len());
     for package in workspace_packages {
-        let normalized = package
-            .manifest_path
-            .normalize()
-            .map_or_else(|_| package.manifest_path.clone(), normpath::BasePathBuf::into_path_buf);
-        let relative = normalized.strip_prefix(git_root).map_err(|_error| {
-            error::Error::Other(format!(
-                "Workspace package manifest '{}' is outside Git root '{}'",
-                package.manifest_path.display(),
-                git_root.display()
-            ))
-        })?;
-        let manifest_path = portable_relative_path(relative)?;
-        packages.push(PackageIdentity {
-            id: package.id.clone(),
+        packages.push(SnapshotPackage {
             name: package.name.clone(),
             version: package.version.clone(),
-            manifest_path,
+            manifest_path: package_manifest_path(package, git_root)?,
         });
     }
     packages.sort_by(|left, right| {
@@ -357,9 +302,23 @@ fn package_identities(workspace_packages: &[&cargo::CargoPackage], git_root: &Pa
             .cmp(&right.name)
             .then_with(|| left.version.cmp(&right.version))
             .then_with(|| left.manifest_path.cmp(&right.manifest_path))
-            .then_with(|| left.id.cmp(&right.id))
     });
     Ok(packages)
+}
+
+pub(crate) fn package_manifest_path(package: &cargo::CargoPackage, git_root: &Path) -> error::Result<String> {
+    let normalized = package
+        .manifest_path
+        .normalize()
+        .map_or_else(|_| package.manifest_path.clone(), normpath::BasePathBuf::into_path_buf);
+    let relative = normalized.strip_prefix(git_root).map_err(|_error| {
+        error::Error::Other(format!(
+            "Workspace package manifest '{}' is outside Git root '{}'",
+            package.manifest_path.display(),
+            git_root.display()
+        ))
+    })?;
+    portable_relative_path(relative)
 }
 
 fn portable_relative_path(path: &Path) -> error::Result<String> {
@@ -407,23 +366,15 @@ fn validate_portable_relative_path(path: &str) -> error::Result<()> {
     Ok(())
 }
 
-fn validate_file_tree(node: &FileNode, package_ids: &HashSet<&str>) -> error::Result<()> {
-    let _ = portable_relative_path(&node.path)?;
-    if matches!(node.kind, FileKind::Package) {
-        let package_id = node.package_id.as_deref().ok_or_else(|| {
-            error::Error::Other(format!(
-                "Snapshot schema {SNAPSHOT_SCHEMA} package node '{}' has no package ID",
-                node.path.display()
-            ))
-        })?;
-        if !package_ids.contains(package_id) {
-            return Err(error::Error::Other(format!(
-                "Snapshot file ownership refers to unknown package ID '{package_id}'"
-            )));
-        }
+fn validate_file_tree(node: &FileNode, package_manifests: &HashSet<&str>) -> error::Result<()> {
+    let node_path = portable_relative_path(&node.path)?;
+    if matches!(node.kind, FileKind::Package) && !package_manifests.contains(node_path.as_str()) {
+        return Err(error::Error::Other(format!(
+            "Snapshot file ownership refers to unknown package manifest '{node_path}'"
+        )));
     }
     for child in &node.children {
-        validate_file_tree(child, package_ids)?;
+        validate_file_tree(child, package_manifests)?;
     }
     Ok(())
 }
@@ -528,18 +479,18 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
     let mut workspace_packages = cargo::get_workspace_packages(&metadata);
     workspace_packages.sort_by(|left, right| left.id.cmp(&right.id));
     let mut files = files::build_tree(host, &metadata, &workspace_packages, config);
-    let dependencies = match dependencies::parse(&metadata) {
-        Ok(dependencies) => dependencies,
+    let packages = match snapshot_packages(&workspace_packages, &git_root) {
+        Ok(packages) => packages,
         Err(error) => {
-            let _ = writeln!(host.error(), "Error creating workspace dependency graph: {error}");
+            let _ = writeln!(host.error(), "Error creating package records: {error}");
             host.exit(1);
             return;
         }
     };
-    let packages = match package_identities(&workspace_packages, &git_root) {
-        Ok(packages) => packages,
+    let dependencies = match dependencies::parse(&workspace_packages, &git_root) {
+        Ok(dependencies) => dependencies,
         Err(error) => {
-            let _ = writeln!(host.error(), "Error creating package identities: {error}");
+            let _ = writeln!(host.error(), "Error creating workspace dependency graph: {error}");
             host.exit(1);
             return;
         }
@@ -783,9 +734,9 @@ fn emit_result(result: &Impact, workspace: &WorkspaceTree, format: OutputFormat,
             let selected: HashSet<String> = union_of_tiers(result, tiers).into_iter().collect();
             let unselected: HashSet<String> = workspace
                 .dependencies
-                .get_all_package_ids()
+                .get_all_package_manifests()
                 .into_iter()
-                .filter(|package_id| !selected.contains(package_id))
+                .filter(|package_manifest| !selected.contains(package_manifest))
                 .collect();
             let joined = workspace
                 .package_names(&unselected)?
@@ -861,7 +812,7 @@ fn trip_wire_impact(host: &mut impl Host, current_tree: &WorkspaceTree, git_diff
     }
     let _ = writeln!(host.error());
 
-    let all_packages: HashSet<String> = current_tree.dependencies.get_all_package_ids().into_iter().collect();
+    let all_packages: HashSet<String> = current_tree.dependencies.get_all_package_manifests().into_iter().collect();
     Some(Impact {
         modified: all_packages.clone(),
         affected: all_packages.clone(),
@@ -885,18 +836,19 @@ fn get_impacted_packages(
     }
 
     for deleted_file in &git_diff.deleted {
-        let packages_for_file = baseline_tree.files.find_packages_containing_file(deleted_file);
+        let package_manifests = baseline_tree.files.find_package_manifests_containing_file(deleted_file);
 
-        for baseline_id in packages_for_file {
-            if let Some(current_id) = current_tree.current_id_for(baseline_tree, &baseline_id)? {
-                let _ = modified.insert(current_id);
+        for baseline_manifest in package_manifests {
+            let baseline_manifest = portable_relative_path(&baseline_manifest)?;
+            if current_tree.package_by_manifest(&baseline_manifest).is_some() {
+                let _ = modified.insert(baseline_manifest);
                 continue;
             }
 
-            if let Some(dependents) = baseline_tree.dependencies.get_dependents_transitive(&baseline_id) {
+            if let Some(dependents) = baseline_tree.dependencies.get_dependents_transitive(&baseline_manifest) {
                 for dependent in dependents {
-                    if let Some(current_id) = current_tree.current_id_for(baseline_tree, &dependent)? {
-                        let _ = affected_seeds.insert(current_id);
+                    if current_tree.package_by_manifest(&dependent).is_some() {
+                        let _ = affected_seeds.insert(dependent);
                     }
                 }
             }
@@ -904,15 +856,10 @@ fn get_impacted_packages(
     }
 
     for changed_file in &git_diff.changed {
-        let packages_for_file = current_tree.files.find_packages_containing_file(changed_file);
+        let package_manifests = current_tree.files.find_package_manifests_containing_file(changed_file);
 
-        for package_id in packages_for_file {
-            let current_id = current_tree.current_id_for(current_tree, &package_id)?.ok_or_else(|| {
-                error::Error::Other(format!(
-                    "Current snapshot file ownership refers to package '{package_id}' that is not in the current workspace"
-                ))
-            })?;
-            let _ = modified.insert(current_id);
+        for package_manifest in package_manifests {
+            let _ = modified.insert(portable_relative_path(&package_manifest)?);
         }
     }
 
@@ -920,23 +867,18 @@ fn get_impacted_packages(
     let branch_files = current_tree.files.distinct();
 
     for new_file in branch_files.difference(&main_files) {
-        let packages_for_file = current_tree.files.find_packages_containing_file(new_file);
+        let package_manifests = current_tree.files.find_package_manifests_containing_file(new_file);
 
-        for package_id in packages_for_file {
-            let current_id = current_tree.current_id_for(current_tree, &package_id)?.ok_or_else(|| {
-                error::Error::Other(format!(
-                    "Current snapshot file ownership refers to package '{package_id}' that is not in the current workspace"
-                ))
-            })?;
-            let _ = modified.insert(current_id);
+        for package_manifest in package_manifests {
+            let _ = modified.insert(portable_relative_path(&package_manifest)?);
         }
     }
 
     // Affected = Modified + all their dependents
     let mut affected = modified.clone();
     affected.extend(affected_seeds);
-    for package_id in affected.clone() {
-        if let Some(transitive_dependents) = current_tree.dependencies.get_dependents_transitive(&package_id) {
+    for package_manifest in affected.clone() {
+        if let Some(transitive_dependents) = current_tree.dependencies.get_dependents_transitive(&package_manifest) {
             for dependent in transitive_dependents {
                 let _ = affected.insert(dependent);
             }
@@ -945,8 +887,8 @@ fn get_impacted_packages(
 
     // Required = Affected + all their dependencies
     let mut required = affected.clone();
-    for package_id in &affected {
-        if let Some(transitive_deps) = current_tree.dependencies.get_dependencies_transitive(package_id) {
+    for package_manifest in &affected {
+        if let Some(transitive_deps) = current_tree.dependencies.get_dependencies_transitive(package_manifest) {
             for dependency in transitive_deps {
                 let _ = required.insert(dependency);
             }
@@ -969,9 +911,10 @@ mod tests {
     use crate::cargo::{CargoDependency, CargoMetadata, CargoPackage, CargoTarget};
     use crate::test_helpers::*;
 
-    type PackageDef<'a> = (&'a str, &'a str, &'a str, &'a str, &'a [&'a str], &'a [&'a str]);
+    type PackageDef<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], &'a [&'a str]);
 
     fn make_metadata(package_dependencies: &[(&str, &[&str])]) -> CargoMetadata {
+        let workspace_root = PathBuf::from("/workspace");
         let mut packages = Vec::new();
         for (name, dependencies) in package_dependencies {
             packages.push(CargoPackage {
@@ -982,15 +925,15 @@ mod tests {
                 targets: vec![CargoTarget {
                     name: name.to_string(),
                     kind: vec!["lib".to_string()],
-                    src_path: PathBuf::from(format!("{name}/src/lib.rs")),
+                    src_path: workspace_root.join(name).join("src/lib.rs"),
                 }],
-                manifest_path: PathBuf::from(format!("{name}/Cargo.toml")),
+                manifest_path: workspace_root.join(name).join("Cargo.toml"),
                 dependencies: dependencies
                     .iter()
                     .map(|dependency| CargoDependency {
                         name: (*dependency).to_string(),
                         source: None,
-                        path: Some(PathBuf::from(dependency)),
+                        path: Some(workspace_root.join(dependency)),
                     })
                     .collect(),
             });
@@ -999,16 +942,16 @@ mod tests {
         CargoMetadata {
             packages,
             workspace_members,
-            workspace_root: PathBuf::from("/workspace"),
-            target_directory: PathBuf::from("/workspace/target"),
+            workspace_root: workspace_root.clone(),
+            target_directory: workspace_root.join("target"),
         }
     }
 
     fn make_file_tree(package_files: &[(&str, &[&str])]) -> FileNode {
         let mut root = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
-        for (package_id, files) in package_files {
-            let manifest = PathBuf::from(format!("{package_id}/Cargo.toml"));
-            let mut package_node = FileNode::for_package(manifest, (*package_id).to_owned());
+        for (package_name, files) in package_files {
+            let manifest = PathBuf::from(format!("{package_name}/Cargo.toml"));
+            let mut package_node = FileNode::new(manifest, FileKind::Package);
             for file in *files {
                 package_node.add_child(FileNode::new(PathBuf::from(*file), FileKind::Target));
             }
@@ -1023,77 +966,65 @@ mod tests {
 
         let metadata = make_metadata(&dependencies);
         let files = make_file_tree(&package_files);
-        let packages = metadata
-            .packages
-            .iter()
-            .map(|package| PackageIdentity {
-                id: package.id.clone(),
-                name: package.name.clone(),
-                version: package.version.clone(),
-                manifest_path: format!("{}/Cargo.toml", package.name),
-            })
-            .collect();
+        let workspace_packages = cargo::get_workspace_packages(&metadata);
+        let packages = snapshot_packages(&workspace_packages, &metadata.workspace_root).unwrap();
 
         WorkspaceTree {
             schema: SNAPSHOT_SCHEMA,
             packages,
             files,
-            dependencies: dependencies::parse(&metadata).unwrap(),
+            dependencies: dependencies::parse(&workspace_packages, &metadata.workspace_root).unwrap(),
         }
     }
 
     fn make_schema1_workspace(package_defs: &[PackageDef<'_>]) -> WorkspaceTree {
-        let packages = package_defs
-            .iter()
-            .map(|(id, name, version, manifest_path, _, _)| PackageIdentity {
-                id: (*id).to_string(),
-                name: (*name).to_string(),
-                version: (*version).to_string(),
-                manifest_path: (*manifest_path).to_string(),
-            })
-            .collect();
+        let workspace_root = PathBuf::from("/workspace");
         let metadata = CargoMetadata {
             packages: package_defs
                 .iter()
-                .map(|(id, name, version, manifest_path, _, dependencies)| CargoPackage {
-                    id: (*id).to_string(),
+                .enumerate()
+                .map(|(index, (name, version, manifest_path, _, dependencies))| CargoPackage {
+                    id: format!("fixture-package-{index}"),
                     name: (*name).to_string(),
                     version: (*version).to_string(),
                     source: None,
                     targets: Vec::new(),
-                    manifest_path: PathBuf::from(manifest_path),
+                    manifest_path: workspace_root.join(manifest_path),
                     dependencies: dependencies
                         .iter()
-                        .filter_map(|dependency_id| {
-                            package_defs.iter().find(|(id, ..)| id == dependency_id).map(
-                                |(_, dependency_name, _, dependency_manifest, _, _)| CargoDependency {
+                        .filter_map(|dependency_manifest| {
+                            package_defs
+                                .iter()
+                                .find(|(_, _, manifest_path, _, _)| manifest_path == dependency_manifest)
+                                .map(|(dependency_name, _, dependency_manifest, _, _)| CargoDependency {
                                     name: (*dependency_name).to_string(),
                                     source: None,
-                                    path: Path::new(dependency_manifest).parent().map(Path::to_path_buf),
-                                },
-                            )
+                                    path: workspace_root.join(dependency_manifest).parent().map(Path::to_path_buf),
+                                })
                         })
                         .collect(),
                 })
                 .collect(),
-            workspace_members: package_defs.iter().map(|(id, ..)| (*id).to_string()).collect(),
-            workspace_root: PathBuf::from("/workspace"),
-            target_directory: PathBuf::from("/workspace/target"),
+            workspace_members: (0..package_defs.len()).map(|index| format!("fixture-package-{index}")).collect(),
+            workspace_root: workspace_root.clone(),
+            target_directory: workspace_root.join("target"),
         };
         let mut files = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
-        for (id, _, _, manifest_path, package_files, _) in package_defs {
-            let mut package_node = FileNode::for_package(PathBuf::from(manifest_path), (*id).to_string());
+        for (_, _, manifest_path, package_files, _) in package_defs {
+            let mut package_node = FileNode::new(PathBuf::from(manifest_path), FileKind::Package);
             for file in *package_files {
                 package_node.add_child(FileNode::new(PathBuf::from(file), FileKind::Target));
             }
             files.add_child(package_node);
         }
+        let workspace_packages = cargo::get_workspace_packages(&metadata);
+        let packages = snapshot_packages(&workspace_packages, &workspace_root).unwrap();
 
         WorkspaceTree {
             schema: SNAPSHOT_SCHEMA,
             packages,
             files,
-            dependencies: dependencies::parse(&metadata).unwrap(),
+            dependencies: dependencies::parse(&workspace_packages, &workspace_root).unwrap(),
         }
     }
 
@@ -1128,8 +1059,8 @@ mod tests {
 
         let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
-        assert!(result.modified.contains("lib"));
-        assert!(!result.modified.contains("app"));
+        assert!(result.modified.contains("lib/Cargo.toml"));
+        assert!(!result.modified.contains("app/Cargo.toml"));
     }
 
     #[test]
@@ -1144,9 +1075,9 @@ mod tests {
 
         let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
-        assert!(result.modified.contains("lib"));
-        assert!(result.affected.contains("lib"));
-        assert!(result.affected.contains("app"));
+        assert!(result.modified.contains("lib/Cargo.toml"));
+        assert!(result.affected.contains("lib/Cargo.toml"));
+        assert!(result.affected.contains("app/Cargo.toml"));
     }
 
     #[test]
@@ -1166,12 +1097,12 @@ mod tests {
 
         let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
-        assert!(result.modified.contains("middleware"));
-        assert!(result.affected.contains("app"));
-        assert!(result.affected.contains("middleware"));
-        assert!(result.required.contains("core"));
-        assert!(result.required.contains("middleware"));
-        assert!(result.required.contains("app"));
+        assert!(result.modified.contains("middleware/Cargo.toml"));
+        assert!(result.affected.contains("app/Cargo.toml"));
+        assert!(result.affected.contains("middleware/Cargo.toml"));
+        assert!(result.required.contains("core/Cargo.toml"));
+        assert!(result.required.contains("middleware/Cargo.toml"));
+        assert!(result.required.contains("app/Cargo.toml"));
     }
 
     #[test]
@@ -1187,7 +1118,7 @@ mod tests {
 
         let result = get_impacted_packages(&mut host, &baseline, &current, &diff, &config).unwrap();
 
-        assert!(result.modified.contains("lib"));
+        assert!(result.modified.contains("lib/Cargo.toml"));
     }
 
     #[test]
@@ -1203,27 +1134,25 @@ mod tests {
 
         let result = get_impacted_packages(&mut host, &baseline, &current, &diff, &config).unwrap();
 
-        assert!(result.modified.contains("lib"));
+        assert!(result.modified.contains("lib/Cargo.toml"));
     }
 
     #[test]
-    fn canonical_package_ids_drive_ownership_and_dependency_edges() {
-        const APP_ID: &str = "path+file:///repo/tools/app-folder#application@2.0.0";
-        const LIB_ID: &str = "path+file:///repo/components/not-the-package-name#package-name@1.2.3";
+    fn manifest_paths_drive_ownership_and_dependency_edges() {
+        const APP_MANIFEST: &str = "tools/app-folder/Cargo.toml";
+        const LIB_MANIFEST: &str = "components/not-the-package-name/Cargo.toml";
         let tree = make_schema1_workspace(&[
             (
-                APP_ID,
                 "application",
                 "2.0.0",
-                "tools/app-folder/Cargo.toml",
+                APP_MANIFEST,
                 &["tools/app-folder/src/main.rs"],
-                &[LIB_ID],
+                &[LIB_MANIFEST],
             ),
             (
-                LIB_ID,
                 "package-name",
                 "1.2.3",
-                "components/not-the-package-name/Cargo.toml",
+                LIB_MANIFEST,
                 &["components/not-the-package-name/src/lib.rs"],
                 &[],
             ),
@@ -1235,20 +1164,19 @@ mod tests {
 
         let result = get_impacted_packages(&mut TestHost::new(), &tree, &tree, &diff, &MainConfig::default()).unwrap();
 
-        assert_eq!(result.modified, HashSet::from([LIB_ID.to_string()]));
-        assert_eq!(result.affected, HashSet::from([LIB_ID.to_string(), APP_ID.to_string()]));
+        assert_eq!(result.modified, HashSet::from([LIB_MANIFEST.to_string()]));
+        assert_eq!(result.affected, HashSet::from([LIB_MANIFEST.to_string(), APP_MANIFEST.to_string()]));
     }
 
     #[test]
     fn deleted_baseline_package_is_not_emitted_but_surviving_dependent_is_affected() {
-        const BASELINE_APP: &str = "path+file:///baseline/app#app@1.0.0";
-        const CURRENT_APP: &str = "path+file:///current/app#app@1.0.0";
-        const DELETED_LIB: &str = "path+file:///baseline/lib#removed-lib@1.0.0";
+        const APP_MANIFEST: &str = "app/Cargo.toml";
+        const DELETED_LIB_MANIFEST: &str = "lib/Cargo.toml";
         let baseline = make_schema1_workspace(&[
-            (BASELINE_APP, "app", "1.0.0", "app/Cargo.toml", &["app/src/main.rs"], &[DELETED_LIB]),
-            (DELETED_LIB, "removed-lib", "1.0.0", "lib/Cargo.toml", &["lib/src/lib.rs"], &[]),
+            ("app", "1.0.0", APP_MANIFEST, &["app/src/main.rs"], &[DELETED_LIB_MANIFEST]),
+            ("removed-lib", "1.0.0", DELETED_LIB_MANIFEST, &["lib/src/lib.rs"], &[]),
         ]);
-        let current = make_schema1_workspace(&[(CURRENT_APP, "app", "1.0.0", "app/Cargo.toml", &["app/src/main.rs"], &[])]);
+        let current = make_schema1_workspace(&[("app", "1.0.0", APP_MANIFEST, &["app/src/main.rs"], &[])]);
         let diff = GitDiff {
             changed: Vec::new(),
             deleted: vec![PathBuf::from("lib/src/lib.rs")],
@@ -1257,8 +1185,8 @@ mod tests {
         let result = get_impacted_packages(&mut TestHost::new(), &baseline, &current, &diff, &MainConfig::default()).unwrap();
 
         assert!(result.modified.is_empty());
-        assert_eq!(result.affected, HashSet::from([CURRENT_APP.to_string()]));
-        assert_eq!(result.required, HashSet::from([CURRENT_APP.to_string()]));
+        assert_eq!(result.affected, HashSet::from([APP_MANIFEST.to_string()]));
+        assert_eq!(result.required, HashSet::from([APP_MANIFEST.to_string()]));
     }
 
     #[test]
@@ -1276,10 +1204,10 @@ mod tests {
 
         let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
-        assert!(result.modified.contains("app"));
-        assert!(result.modified.contains("lib"));
-        assert!(result.affected.contains("app"));
-        assert!(result.affected.contains("lib"));
+        assert!(result.modified.contains("app/Cargo.toml"));
+        assert!(result.modified.contains("lib/Cargo.toml"));
+        assert!(result.affected.contains("app/Cargo.toml"));
+        assert!(result.affected.contains("lib/Cargo.toml"));
         assert!(host.stderr_str().contains("Trip wire activated"));
     }
 
@@ -1298,7 +1226,7 @@ mod tests {
 
         let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
-        assert!(result.modified.contains("lib"));
+        assert!(result.modified.contains("lib/Cargo.toml"));
         assert!(host.stderr_str().contains("no matching files were found"));
     }
 
@@ -1317,7 +1245,7 @@ mod tests {
 
         let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config).unwrap();
 
-        assert!(result.modified.contains("app"));
+        assert!(result.modified.contains("app/Cargo.toml"));
         assert!(host.stderr_str().contains("Trip wire activated"));
     }
 
@@ -1325,15 +1253,21 @@ mod tests {
 
     fn sample_impact() -> Impact {
         Impact {
-            modified: core::iter::once("a").map(String::from).collect(),
-            affected: ["a", "b"].into_iter().map(String::from).collect(),
-            required: ["a", "b", "c"].into_iter().map(String::from).collect(),
+            modified: core::iter::once("a/Cargo.toml").map(String::from).collect(),
+            affected: ["a/Cargo.toml", "b/Cargo.toml"].into_iter().map(String::from).collect(),
+            required: ["a/Cargo.toml", "b/Cargo.toml", "c/Cargo.toml"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
         }
     }
 
-    fn sample_workspace_names() -> Vec<String> {
+    fn sample_workspace_manifests() -> Vec<String> {
         // A workspace of 5 packages; impact above touches a/b/c, leaves d/e untouched.
-        ["a", "b", "c", "d", "e"].into_iter().map(String::from).collect()
+        ["a", "b", "c", "d", "e"]
+            .into_iter()
+            .map(|name| format!("{name}/Cargo.toml"))
+            .collect()
     }
 
     fn sample_workspace() -> WorkspaceTree {
@@ -1369,9 +1303,15 @@ mod tests {
     fn union_of_tiers_dedupes_and_sorts() {
         let impact = sample_impact();
         // Affected ⊇ Modified, Required ⊇ Affected — union with all three == required.
-        assert_eq!(union_of_tiers(&impact, all_tiers()), vec!["a", "b", "c"]);
-        assert_eq!(union_of_tiers(&impact, TierMask::resolve(true, false, false)), vec!["a"]);
-        assert_eq!(union_of_tiers(&impact, TierMask::resolve(false, true, false)), vec!["a", "b"]);
+        assert_eq!(
+            union_of_tiers(&impact, all_tiers()),
+            vec!["a/Cargo.toml", "b/Cargo.toml", "c/Cargo.toml"]
+        );
+        assert_eq!(union_of_tiers(&impact, TierMask::resolve(true, false, false)), vec!["a/Cargo.toml"]);
+        assert_eq!(
+            union_of_tiers(&impact, TierMask::resolve(false, true, false)),
+            vec!["a/Cargo.toml", "b/Cargo.toml"]
+        );
     }
 
     #[test]
@@ -1458,9 +1398,9 @@ mod tests {
     fn emit_result_cargo_excludes_full_workspace_selection_emits_nothing() {
         // Selection covers the whole workspace (e.g. trip wire fired) → no excludes.
         let full = Impact {
-            modified: sample_workspace_names().into_iter().collect(),
-            affected: sample_workspace_names().into_iter().collect(),
-            required: sample_workspace_names().into_iter().collect(),
+            modified: sample_workspace_manifests().into_iter().collect(),
+            affected: sample_workspace_manifests().into_iter().collect(),
+            required: sample_workspace_manifests().into_iter().collect(),
         };
         let output = emit_result(&full, &sample_workspace(), OutputFormat::CargoExcludes, all_tiers()).unwrap();
         assert!(output.is_empty());
@@ -1482,27 +1422,13 @@ mod tests {
     #[test]
     fn emit_result_packages_emits_sorted_canonical_specs() {
         let workspace = make_schema1_workspace(&[
-            (
-                "path+file:///repo/z#zeta@2.0.0",
-                "zeta",
-                "2.0.0",
-                "z/Cargo.toml",
-                &["z/src/lib.rs"],
-                &[],
-            ),
-            (
-                "path+file:///repo/a#alpha@1.0.0",
-                "alpha",
-                "1.0.0",
-                "a/Cargo.toml",
-                &["a/src/lib.rs"],
-                &[],
-            ),
+            ("zeta", "2.0.0", "z/Cargo.toml", &["z/src/lib.rs"], &[]),
+            ("alpha", "1.0.0", "a/Cargo.toml", &["a/src/lib.rs"], &[]),
         ]);
         let impact = Impact {
             modified: HashSet::new(),
             affected: HashSet::new(),
-            required: workspace.dependencies.get_all_package_ids().into_iter().collect(),
+            required: workspace.dependencies.get_all_package_manifests().into_iter().collect(),
         };
 
         let output = emit_result(&impact, &workspace, OutputFormat::Packages, TierMask::resolve(false, false, true)).unwrap();
@@ -1512,14 +1438,7 @@ mod tests {
 
     #[test]
     fn emit_result_packages_empty_selection_is_zero_bytes() {
-        let workspace = make_schema1_workspace(&[(
-            "path+file:///repo/a#alpha@1.0.0",
-            "alpha",
-            "1.0.0",
-            "a/Cargo.toml",
-            &["a/src/lib.rs"],
-            &[],
-        )]);
+        let workspace = make_schema1_workspace(&[("alpha", "1.0.0", "a/Cargo.toml", &["a/src/lib.rs"], &[])]);
         let empty = Impact {
             modified: HashSet::new(),
             affected: HashSet::new(),
@@ -1532,32 +1451,13 @@ mod tests {
     }
 
     #[test]
-    fn emit_result_packages_rejects_duplicate_name_and_version() {
+    fn snapshot_rejects_duplicate_name_and_version() {
         let workspace = make_schema1_workspace(&[
-            (
-                "path+file:///repo/a#shared@1.0.0",
-                "shared",
-                "1.0.0",
-                "a/Cargo.toml",
-                &["a/src/lib.rs"],
-                &[],
-            ),
-            (
-                "path+file:///repo/b#shared@1.0.0",
-                "shared",
-                "1.0.0",
-                "b/Cargo.toml",
-                &["b/src/lib.rs"],
-                &[],
-            ),
+            ("shared", "1.0.0", "a/Cargo.toml", &["a/src/lib.rs"], &[]),
+            ("shared", "1.0.0", "b/Cargo.toml", &["b/src/lib.rs"], &[]),
         ]);
-        let empty = Impact {
-            modified: HashSet::new(),
-            affected: HashSet::new(),
-            required: HashSet::new(),
-        };
 
-        let error = emit_result(&empty, &workspace, OutputFormat::Packages, all_tiers()).unwrap_err();
+        let error = workspace.validate().unwrap_err();
 
         assert!(error.to_string().contains("ambiguous package spec 'shared@1.0.0'"));
     }
@@ -1580,14 +1480,7 @@ mod tests {
 
     #[test]
     fn unsupported_snapshot_schema_is_rejected_clearly() {
-        let mut snapshot = make_schema1_workspace(&[(
-            "path+file:///repo/a#alpha@1.0.0",
-            "alpha",
-            "1.0.0",
-            "a/Cargo.toml",
-            &["a/src/lib.rs"],
-            &[],
-        )]);
+        let mut snapshot = make_schema1_workspace(&[("alpha", "1.0.0", "a/Cargo.toml", &["a/src/lib.rs"], &[])]);
         snapshot.schema = SNAPSHOT_SCHEMA + 1;
 
         let error = snapshot.validate().unwrap_err();
@@ -1762,7 +1655,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn snapshot_output_matches_stdout_and_contains_canonical_identity() {
+    fn snapshot_output_matches_stdout_and_uses_stable_manifest_identity() {
         let directory = test_directory("snapshot-output");
         let package_directory = directory.join("portable");
         std::fs::create_dir_all(package_directory.join("src")).unwrap();
@@ -1773,10 +1666,10 @@ mod tests {
         .unwrap();
         std::fs::write(package_directory.join("src").join("lib.rs"), "pub fn portable() {}\n").unwrap();
 
-        let package_id = "path+file:///repo/portable#portable@1.2.3";
+        let cargo_package_id = "path+file:///repo/portable#portable@1.2.3";
         let metadata = CargoMetadata {
             packages: vec![CargoPackage {
-                id: package_id.to_string(),
+                id: cargo_package_id.to_string(),
                 name: "portable".to_string(),
                 version: "1.2.3".to_string(),
                 source: None,
@@ -1788,7 +1681,7 @@ mod tests {
                 manifest_path: package_directory.join("Cargo.toml"),
                 dependencies: Vec::new(),
             }],
-            workspace_members: vec![package_id.to_string()],
+            workspace_members: vec![cargo_package_id.to_string()],
             workspace_root: directory.clone(),
             target_directory: directory.join("target"),
         };
@@ -1818,18 +1711,19 @@ mod tests {
         let snapshot_json: serde_json::Value = serde_json::from_slice(&file_bytes).unwrap();
         assert!(snapshot_json.get("dependencies").is_some());
         assert!(snapshot_json.get("crates").is_none());
+        assert!(snapshot_json["packages"][0].get("id").is_none());
+        assert!(snapshot_json["files"]["children"][0].get("package_id").is_none());
         let snapshot: WorkspaceTree = serde_json::from_slice(&file_bytes).unwrap();
         assert_eq!(snapshot.schema, SNAPSHOT_SCHEMA);
         assert_eq!(
             snapshot.packages,
-            vec![PackageIdentity {
-                id: package_id.to_string(),
+            vec![SnapshotPackage {
                 name: "portable".to_string(),
                 version: "1.2.3".to_string(),
                 manifest_path: "portable/Cargo.toml".to_string(),
             }]
         );
-        assert_eq!(snapshot.files.children[0].package_id.as_deref(), Some(package_id));
+        assert_eq!(snapshot.files.children[0].path, PathBuf::from("portable/Cargo.toml"));
 
         let mut stdout_host = TestHost::new().with_commands(vec![
             Ok(success_output(&metadata_json)),
@@ -1845,14 +1739,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn impact_changed_files_writes_package_specs_without_stdout() {
         let directory = test_directory("impact-output");
-        let workspace = make_schema1_workspace(&[(
-            "path+file:///repo/lib#portable-lib@1.2.3",
-            "portable-lib",
-            "1.2.3",
-            "lib/Cargo.toml",
-            &["lib/src/lib.rs"],
-            &[],
-        )]);
+        let workspace = make_schema1_workspace(&[("portable-lib", "1.2.3", "lib/Cargo.toml", &["lib/src/lib.rs"], &[])]);
         let baseline = directory.join("baseline.json");
         let current = directory.join("current.json");
         let changes = directory.join("changes.json");

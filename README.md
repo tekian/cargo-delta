@@ -288,15 +288,15 @@ cargo-delta computes impact between packages because that is the unit Cargo's
 
 Schema `1` has three data fields:
 
-- **`packages`** is the canonical identity table for workspace members. Each
-  record contains Cargo's package ID, package name, version, and
-  Git-root-relative manifest path.
+- **`packages`** describes each workspace member by package name, version, and
+  Git-root-relative manifest path. The manifest path is its stable snapshot
+  identity.
 - **`files`** is the recursive input tree. Its nodes represent manifests,
   Cargo targets, Rust modules, `include!` inputs, configured file references,
-  and assumed inputs. Each package-root node carries the owning package ID.
-- **`dependencies`** maps each package ID to its direct workspace dependency
-  package IDs. cargo-delta traverses it in both directions to compute affected
-  and required sets.
+  and assumed inputs. A package-root node's path identifies its owner.
+- **`dependencies`** maps each package manifest path to the manifest paths of
+  its direct workspace dependencies. cargo-delta traverses it in both
+  directions to compute affected and required sets.
 
 For example, a two-package workspace snapshot starts like this:
 
@@ -305,13 +305,11 @@ For example, a two-package workspace snapshot starts like this:
   "schema": 1,
   "packages": [
     {
-      "id": "path+file:///repo/crates/app#app@1.0.0",
       "name": "app",
       "version": "1.0.0",
       "manifest_path": "crates/app/Cargo.toml"
     },
     {
-      "id": "path+file:///repo/crates/core#core@1.0.0",
       "name": "core",
       "version": "1.0.0",
       "manifest_path": "crates/core/Cargo.toml"
@@ -324,16 +322,15 @@ For example, a two-package workspace snapshot starts like this:
       {
         "path": "crates/app/Cargo.toml",
         "kind": "Package",
-        "package_id": "path+file:///repo/crates/app#app@1.0.0",
         "children": []
       }
     ]
   },
   "dependencies": {
-    "path+file:///repo/crates/app#app@1.0.0": [
-      "path+file:///repo/crates/core#core@1.0.0"
+    "crates/app/Cargo.toml": [
+      "crates/core/Cargo.toml"
     ],
-    "path+file:///repo/crates/core#core@1.0.0": []
+    "crates/core/Cargo.toml": []
   }
 }
 ```

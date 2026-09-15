@@ -37,7 +37,6 @@ Snapshot schema 1 contains:
 {
   "schema": 1,
   "packages": [{
-    "id": "path+file:///repo/crates/foo#foo@1.2.3",
     "name": "foo",
     "version": "1.2.3",
     "manifest_path": "crates/foo/Cargo.toml"
@@ -48,16 +47,16 @@ Snapshot schema 1 contains:
     "children": []
   },
   "dependencies": {
-    "path+file:///repo/crates/foo#foo@1.2.3": []
+    "crates/foo/Cargo.toml": []
   }
 }
 ```
 
-The ID is Cargo's package ID. Manifest and file paths are Git-root-relative and
-serialize with `/` separators. File ownership and workspace dependency edges
-reference package IDs; package names and target names are not used as graph
-identity. A package-root manifest has file kind `Package`; the Rust crate
-targets built by that package have file kind `Target`.
+Manifest and file paths are Git-root-relative and serialize with `/`
+separators. A package's manifest path is its stable identity for file ownership
+and dependency edges, so snapshots of different worktrees use the same keys.
+A package-root manifest has file kind `Package`; the Rust crate targets built
+by that package have file kind `Target`.
 
 Snapshots are derived cache artifacts. The reader accepts only schema 1;
 unversioned cargo-delta 0.3 snapshots and unknown future schemas fail with
@@ -109,10 +108,9 @@ available. The additive `packages` format emits the union of the selected tiers
 as one canonical `name@version` Cargo package spec per line, sorted by package
 name and version.
 
-Every selected internal package ID must map to exactly one package in the
-current snapshot. A current workspace containing duplicate `name@version`
-specs is rejected because a package file could not identify those members
-unambiguously.
+Every selected manifest path must map to exactly one package in the current
+snapshot. A current workspace containing duplicate `name@version` specs is
+rejected because a package file could not identify those members unambiguously.
 
 Existing JSON and human-oriented formats continue to emit package names where
 possible. The current snapshot remains authoritative for emitted selections;
@@ -135,4 +133,4 @@ The higher-level ref-to-artifacts lifecycle is intentionally deferred. This
 change does **not** add `--output-dir`, temporary baseline worktrees, snapshot
 caches, dirty-tree policy, generation manifests, or multi-tier artifact
 directories. Those features can build on the atomic output, explicit change
-sources, canonical package identity, and package-file format defined here.
+sources, stable manifest identity, and package-file format defined here.
