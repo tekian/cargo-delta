@@ -340,7 +340,9 @@ cargo delta impact --baseline main.json --current feature.json --base-ref origin
 | `json` | Selected impact tiers as package-name arrays. |
 | `names` | One package name per line. |
 | `cargo-args` | One line of `-p NAME` arguments. |
+| `cargo-args-versioned` | One line of `-p NAME@VERSION` arguments. |
 | `cargo-excludes` | One line of `--exclude NAME` arguments for unselected workspace packages. |
+| `cargo-excludes-versioned` | One line of `--exclude NAME@VERSION` arguments for unselected workspace packages. |
 | `packages` | One `name@version` package ID per line. |
 
 Use `--output PATH` to write the same output directly instead of relying on

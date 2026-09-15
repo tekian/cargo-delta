@@ -69,9 +69,10 @@ changed and newly discovered files and supplies the dependency graph used for
 affected and required traversal.
 
 `-f packages` emits the selected union as sorted `name@version` package IDs,
-one per line. Existing formats continue to emit package names. `--output`
-writes whichever format was selected to a file instead of stdout. An empty
-selection produces an empty output file.
+one per line. `cargo-args-versioned` and `cargo-excludes-versioned` place those
+IDs after `-p` and `--exclude`; the existing variants continue to emit package
+names. `--output` writes whichever format was selected to a file instead of
+stdout. An empty selection produces an empty output file.
 
 ## Compatibility
 

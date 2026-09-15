@@ -117,6 +117,8 @@ enum OutputFormat {
     /// Space-separated `-p NAME` arguments - drop straight into a `cargo` invocation
     /// via `$(cargo delta run ... -f cargo-args)`.
     CargoArgs,
+    /// Space-separated `-p NAME@VERSION` arguments.
+    CargoArgsVersioned,
     /// Space-separated `--exclude NAME` arguments for the *complement* of the selected
     /// tier(s) within the workspace. Use with `cargo --workspace` to scope to impacted
     /// packages without `-p` ambiguity (since `--exclude` matches workspace members only,
@@ -124,6 +126,8 @@ enum OutputFormat {
     /// selected tier covers (or exceeds) the workspace; combine with `-f names` for
     /// a "nothing impacted" check.
     CargoExcludes,
+    /// Space-separated `--exclude NAME@VERSION` arguments for the workspace complement.
+    CargoExcludesVersioned,
     /// One canonical `name@version` package ID per line.
     Packages,
 }
@@ -443,21 +447,32 @@ fn emit_result(
             }
         }
         OutputFormat::Names => lines(selected.iter().map(package_name)),
-        OutputFormat::CargoArgs => {
+        OutputFormat::CargoArgs | OutputFormat::CargoArgsVersioned => {
+            let versioned = format == OutputFormat::CargoArgsVersioned;
             let joined = selected
                 .iter()
-                .map(|package| format!("-p {}", package_name(package)))
+                .map(|package| {
+                    let package = if versioned { package.as_str() } else { package_name(package) };
+                    format!("-p {package}")
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
             lines(core::iter::once(joined).filter(|value| !value.is_empty()))
         }
-        OutputFormat::CargoExcludes => {
+        OutputFormat::CargoExcludes | OutputFormat::CargoExcludesVersioned => {
+            let versioned = format == OutputFormat::CargoExcludesVersioned;
             let selected: HashSet<PackageId> = selected.into_iter().collect();
             let mut unselected = workspace
                 .get_all_package_ids()
                 .iter()
                 .filter(|package| !selected.contains(*package))
-                .map(|package| package_name(package).to_string())
+                .map(|package| {
+                    if versioned {
+                        package.clone()
+                    } else {
+                        package_name(package).to_string()
+                    }
+                })
                 .collect::<Vec<_>>();
             unselected.sort();
             let joined = unselected
@@ -996,6 +1011,23 @@ mod tests {
     }
 
     #[test]
+    fn emit_result_versioned_cargo_args_include_versions() {
+        let mut host = TestHost::new();
+
+        let ok = emit_result(
+            &mut host,
+            &sample_impact(),
+            &sample_workspace(),
+            OutputFormat::CargoArgsVersioned,
+            all_tiers(),
+            None,
+        );
+
+        assert!(ok);
+        assert_eq!(host.stdout_str(), "-p a@0.1.0 -p b@0.1.0 -p c@0.1.0\n");
+    }
+
+    #[test]
     fn emit_result_cargo_args_empty_tier_emits_blank_line() {
         let mut host = TestHost::new();
         let empty = Impact {
@@ -1024,6 +1056,23 @@ mod tests {
         assert!(ok);
         // Union (all tiers) = {a, b, c}; workspace = {a..e}; complement = {d, e}.
         assert_eq!(host.stdout_str(), "--exclude d --exclude e\n");
+    }
+
+    #[test]
+    fn emit_result_versioned_cargo_excludes_include_versions() {
+        let mut host = TestHost::new();
+
+        let ok = emit_result(
+            &mut host,
+            &sample_impact(),
+            &sample_workspace(),
+            OutputFormat::CargoExcludesVersioned,
+            all_tiers(),
+            None,
+        );
+
+        assert!(ok);
+        assert_eq!(host.stdout_str(), "--exclude d@0.1.0 --exclude e@0.1.0\n");
     }
 
     #[test]
