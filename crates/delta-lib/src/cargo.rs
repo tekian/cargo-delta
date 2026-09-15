@@ -38,9 +38,9 @@ pub struct CargoDependency {
     pub path: Option<PathBuf>,
 }
 
-/// Get cargo metadata from current working directory
-pub fn metadata(host: &mut impl Host) -> Result<CargoMetadata> {
-    let output = host.run_command("cargo", &["metadata", "--format-version", "1", "--no-deps"], None)?;
+/// Get Cargo metadata from the requested working directory.
+pub fn metadata(host: &mut impl Host, working_dir: Option<&std::path::Path>) -> Result<CargoMetadata> {
+    let output = host.run_command("cargo", &["metadata", "--format-version", "1", "--no-deps"], working_dir)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -90,7 +90,7 @@ mod tests {
 
         let mut host = TestHost::new().with_commands(vec![Ok(success_output(&json.to_string()))]);
 
-        let result = metadata(&mut host).unwrap();
+        let result = metadata(&mut host, None).unwrap();
         assert_eq!(result.packages.len(), 1);
         assert_eq!(result.packages[0].name, "my-crate");
         assert_eq!(result.packages[0].version, "0.1.0");
@@ -101,7 +101,7 @@ mod tests {
     fn metadata_returns_error_on_command_failure() {
         let mut host = TestHost::new().with_commands(vec![Ok(failure_output("cargo not found"))]);
 
-        let result = metadata(&mut host);
+        let result = metadata(&mut host, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cargo not found"));
     }
@@ -111,7 +111,7 @@ mod tests {
     fn metadata_returns_error_on_invalid_json() {
         let mut host = TestHost::new().with_commands(vec![Ok(success_output("not valid json"))]);
 
-        let result = metadata(&mut host);
+        let result = metadata(&mut host, None);
         let _ = result.unwrap_err();
     }
 
@@ -119,7 +119,7 @@ mod tests {
     fn metadata_returns_error_on_io_failure() {
         let mut host = TestHost::new().with_commands(vec![Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cargo not installed"))]);
 
-        let result = metadata(&mut host);
+        let result = metadata(&mut host, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cargo not installed"));
     }

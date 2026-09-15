@@ -19,6 +19,7 @@ use crate::files::{FileKind, FileNode};
 use crate::git::GitDiff;
 use crate::packages::{PackageId, Packages};
 
+mod artifacts;
 mod cargo;
 mod config;
 mod error;
@@ -56,7 +57,7 @@ enum CargoSubcommand {
 #[command(about = "Identify impacted Cargo packages from Git changes")]
 struct Args {
     /// Path to configuration file (defaults to `delta.toml`)
-    #[arg(short = 'c', long, value_name = "PATH")]
+    #[arg(short = 'c', long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -76,11 +77,11 @@ enum Commands {
 #[derive(Parser)]
 struct ImpactCommand {
     /// Baseline workspace analysis JSON file (e.g., from main branch)
-    #[arg(long, value_name = "PATH")]
-    baseline: PathBuf,
+    #[arg(long, value_name = "PATH", required_unless_present = "output_dir", conflicts_with = "output_dir")]
+    baseline: Option<PathBuf>,
     /// Current workspace analysis JSON file (e.g., from feature branch)
-    #[arg(long, value_name = "PATH")]
-    current: PathBuf,
+    #[arg(long, value_name = "PATH", required_unless_present = "output_dir", conflicts_with = "output_dir")]
+    current: Option<PathBuf>,
     /// Compare HEAD with the merge base of this Git ref instead of using Git configuration.
     #[arg(long, value_name = "REF", conflicts_with = "changed_files")]
     base_ref: Option<String>,
@@ -88,13 +89,24 @@ struct ImpactCommand {
     #[arg(long, value_name = "PATH", conflicts_with = "base_ref")]
     changed_files: Option<PathBuf>,
     /// Atomically write the selected format to this path instead of stdout.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "output_dir")]
     output: Option<PathBuf>,
+    /// Generate the complete ref-to-artifacts directory instead of using explicit snapshots.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "base_ref",
+        conflicts_with_all = ["baseline", "current", "changed_files", "format", "modified", "affected", "required"]
+    )]
+    output_dir: Option<PathBuf>,
+    /// Policy for tracked or non-ignored untracked workspace changes.
+    #[arg(long, value_enum, value_name = "POLICY", requires = "output_dir")]
+    dirty: Option<DirtyPolicy>,
     /// Output format for stdout or `--output`. Non-json formats emit the union of the
     /// selected tiers; diagnostics remain on stderr, so stdout can be captured directly,
     /// e.g. `cargo build $(cargo delta run ... -f cargo-args)`.
-    #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::Json)]
-    format: OutputFormat,
+    #[arg(short = 'f', long, value_enum)]
+    format: Option<OutputFormat>,
     /// Include packages directly modified by Git changes. If none of `--modified`,
     /// `--affected`, `--required` are given, all three are included (default).
     #[arg(long)]
@@ -129,6 +141,12 @@ enum OutputFormat {
     CargoExcludes,
     /// One canonical `name@version` Cargo package spec per line.
     Packages,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DirtyPolicy {
+    Error,
+    Workspace,
 }
 
 /// Bit-mask of which impact tiers to emit. `none()` means "all on" (default).
@@ -300,7 +318,24 @@ pub fn run(host: &mut impl Host, args: impl IntoIterator<Item = String>) {
     };
 
     match &cli.command {
-        Commands::Impact(cmd) => impact(host, &config, cmd, cli.config.as_ref()),
+        Commands::Impact(cmd) => {
+            if let Some(output_dir) = cmd.output_dir.as_deref() {
+                let base_ref = cmd
+                    .base_ref
+                    .as_deref()
+                    .unwrap_or_else(|| unreachable!("clap requires --base-ref with --output-dir"));
+                artifacts::impact_from_ref(
+                    host,
+                    &config,
+                    cli.config.as_ref(),
+                    base_ref,
+                    output_dir,
+                    cmd.dirty.unwrap_or(DirtyPolicy::Error),
+                );
+            } else {
+                impact(host, &config, cmd, cli.config.as_ref());
+            }
+        }
 
         Commands::Snapshot(cmd) => snapshot(host, &config, cli.config.as_ref(), cmd.output.as_deref()),
     }
@@ -320,7 +355,7 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
     let _ = writeln!(host.error(), "Snapshotting workspace..");
     print_common_props(host, config_path);
 
-    let metadata = match cargo::metadata(host) {
+    let metadata = match cargo::metadata(host, None) {
         Ok(metadata) => metadata,
         Err(e) => {
             let _ = writeln!(host.error(), "Error getting cargo metadata: {e}");
@@ -331,7 +366,7 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
 
     let workspace_root = &metadata.workspace_root;
 
-    let git_root = match git::get_top_level(host) {
+    let git_root = match git::get_top_level(host, None) {
         Ok(root) => root,
         Err(e) => {
             let _ = writeln!(host.error(), "Error getting git root: {e}");
@@ -345,44 +380,21 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
     let _ = writeln!(host.error(), "Detected Cargo workspace : {}", workspace_root.display());
     let _ = writeln!(host.error());
 
-    let mut workspace_packages = cargo::get_workspace_packages(&metadata);
-    workspace_packages.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut files = files::build_tree(host, &metadata, &workspace_packages, config);
-    let packages = match packages::parse(&workspace_packages) {
-        Ok(packages) => packages,
+    let workspace_tree = match build_workspace_tree(host, config, &metadata, &git_root) {
+        Ok(tree) => tree,
         Err(error) => {
-            let _ = writeln!(host.error(), "Error creating workspace package graph: {error}");
+            let _ = writeln!(host.error(), "Error creating workspace snapshot: {error}");
             host.exit(1);
             return;
         }
     };
 
-    if let Err(error) = files.make_relative_paths(&git_root) {
-        let _ = writeln!(host.error(), "Error making snapshot paths portable: {error}");
-        host.exit(1);
-        return;
-    }
-
-    let _ = writeln!(host.error(), "Found {} package(s) in the workspace.", packages.len());
-    let _ = writeln!(host.error(), "Found {} file(s) in the workspace.", files.len());
+    let _ = writeln!(host.error(), "Found {} package(s) in the workspace.", workspace_tree.packages.len());
+    let _ = writeln!(host.error(), "Found {} file(s) in the workspace.", workspace_tree.files.len());
     let _ = writeln!(host.error());
 
-    let workspace_tree = WorkspaceTree {
-        schema: SNAPSHOT_SCHEMA,
-        files,
-        packages,
-    };
-    if let Err(error) = workspace_tree.validate() {
-        let _ = writeln!(host.error(), "Error validating workspace snapshot: {error}");
-        host.exit(1);
-        return;
-    }
-
-    let snapshot_bytes = match serde_json::to_vec_pretty(&workspace_tree) {
-        Ok(mut json_output) => {
-            json_output.push(b'\n');
-            json_output
-        }
+    let snapshot_bytes = match snapshot_bytes(&workspace_tree) {
+        Ok(json_output) => json_output,
         Err(e) => {
             let _ = writeln!(host.error(), "Error serializing workspace tree to JSON: {e}");
             host.exit(1);
@@ -398,6 +410,33 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
 
     let duration = start.elapsed();
     let _ = writeln!(host.error(), "\nSnapshot finished in {duration:.2?}");
+}
+
+fn build_workspace_tree(
+    host: &mut impl Host,
+    config: &MainConfig,
+    metadata: &cargo::CargoMetadata,
+    git_root: &Path,
+) -> error::Result<WorkspaceTree> {
+    let mut workspace_packages = cargo::get_workspace_packages(metadata);
+    workspace_packages.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut files = files::build_tree(host, metadata, &workspace_packages, config);
+    let packages = packages::parse(&workspace_packages)?;
+    files.make_relative_paths(git_root)?;
+
+    let workspace_tree = WorkspaceTree {
+        schema: SNAPSHOT_SCHEMA,
+        files,
+        packages,
+    };
+    workspace_tree.validate()?;
+    Ok(workspace_tree)
+}
+
+fn snapshot_bytes(workspace_tree: &WorkspaceTree) -> error::Result<Vec<u8>> {
+    let mut json_output = serde_json::to_vec_pretty(workspace_tree)?;
+    json_output.push(b'\n');
+    Ok(json_output)
 }
 
 fn report_snapshot_file_coverage(host: &mut impl Host, config: &MainConfig, git_root: &Path, workspace_tree: &WorkspaceTree) {
@@ -445,7 +484,7 @@ fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, co
     let tiers = TierMask::resolve(command.modified, command.affected, command.required);
 
     // Get git root to ensure we're working with consistent path bases
-    let git_root = match git::get_top_level(host) {
+    let git_root = match git::get_top_level(host, None) {
         Ok(root) => root,
         Err(e) => {
             let _ = writeln!(host.error(), "Error getting git root: {e}");
@@ -488,12 +527,14 @@ fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, co
         let _ = writeln!(host.error(), "Deleted file: {}", &deleted.display());
     }
 
+    let (baseline, current) = low_level_snapshot_paths(command);
+
     let _ = writeln!(host.error());
-    let _ = writeln!(host.error(), "Using baseline analysis : {}", command.baseline.display());
-    let _ = writeln!(host.error(), "Using current analysis  : {}", command.current.display());
+    let _ = writeln!(host.error(), "Using baseline analysis : {}", baseline.display());
+    let _ = writeln!(host.error(), "Using current analysis  : {}", current.display());
     let _ = writeln!(host.error());
 
-    let baseline_tree = match load_snapshot(&command.baseline) {
+    let baseline_tree = match load_snapshot(baseline) {
         Ok(tree) => tree,
         Err(e) => {
             let _ = writeln!(host.error(), "Error loading baseline workspace tree: {e}");
@@ -502,7 +543,7 @@ fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, co
         }
     };
 
-    let current_tree = match load_snapshot(&command.current) {
+    let current_tree = match load_snapshot(current) {
         Ok(tree) => tree,
         Err(e) => {
             let _ = writeln!(host.error(), "Error loading current workspace tree: {e}");
@@ -513,7 +554,7 @@ fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, co
 
     let result = get_impacted_packages(host, &baseline_tree, &current_tree, &diff, config);
 
-    let rendered = match emit_result(&result, &current_tree, command.format, tiers) {
+    let rendered = match emit_result(&result, &current_tree, command.format.unwrap_or(OutputFormat::Json), tiers) {
         Ok(rendered) => rendered,
         Err(error) => {
             let _ = writeln!(host.error(), "Error rendering impact: {error}");
@@ -546,6 +587,13 @@ fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, co
     );
     let _ = writeln!(host.error(), "Total       {total_packages:>3} (Total packages in this workspace.)");
     let _ = writeln!(host.error());
+}
+
+fn low_level_snapshot_paths(command: &ImpactCommand) -> (&Path, &Path) {
+    let (Some(baseline), Some(current)) = (&command.baseline, &command.current) else {
+        unreachable!("clap requires --baseline and --current without --output-dir");
+    };
+    (baseline, current)
 }
 
 #[doc(hidden)]
@@ -1336,6 +1384,53 @@ mod tests {
         .expect("conflicting arguments should be rejected");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn output_dir_requires_base_ref() {
+        let error = Cli::try_parse_from(["cargo", "delta", "impact", "--output-dir", "artifacts"])
+            .err()
+            .expect("--output-dir without --base-ref should be rejected");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn high_level_and_low_level_impact_options_are_mutually_exclusive() {
+        for low_level in [
+            ["--baseline", "baseline.json"],
+            ["--current", "current.json"],
+            ["--output", "impact.json"],
+            ["--format", "packages"],
+            ["--modified", ""],
+        ] {
+            let mut arguments = vec![
+                "cargo",
+                "delta",
+                "impact",
+                "--base-ref",
+                "main",
+                "--output-dir",
+                "artifacts",
+                low_level[0],
+            ];
+            if !low_level[1].is_empty() {
+                arguments.push(low_level[1]);
+            }
+            let error = Cli::try_parse_from(arguments)
+                .err()
+                .expect("high-level and low-level options should conflict");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn low_level_impact_still_requires_both_snapshots() {
+        let error = Cli::try_parse_from(["cargo", "delta", "impact", "--baseline", "baseline.json"])
+            .err()
+            .expect("--current should remain required");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     // --- print_common_props tests ---

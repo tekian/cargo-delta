@@ -4,7 +4,7 @@
 
 use cargo_delta_lib::Host;
 use std::io::{self, Write, stderr, stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 /// Default host that runs real OS commands.
@@ -22,6 +22,10 @@ impl Host for RealHost {
 
     fn exit(&mut self, code: i32) {
         std::process::exit(code);
+    }
+
+    fn current_dir(&self) -> io::Result<PathBuf> {
+        std::env::current_dir()
     }
 
     fn run_command(&mut self, command: &str, args: &[&str], working_dir: Option<&Path>) -> io::Result<Output> {

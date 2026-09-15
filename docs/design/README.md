@@ -2,9 +2,8 @@
 
 ## Status
 
-This document describes the currently implemented portable snapshot and
-low-level impact artifact surface. The final section lists follow-up work that
-is intentionally not implemented yet.
+This document describes the implemented portable snapshot, low-level impact,
+and high-level ref-to-artifacts surfaces.
 
 ## Purpose
 
@@ -111,6 +110,126 @@ Existing JSON and human-oriented formats continue to emit package names where
 possible. The current snapshot remains authoritative for emitted selections;
 packages deleted from the baseline are not emitted as current packages.
 
+## High-level ref-to-artifacts command
+
+```text
+cargo delta impact \
+  --base-ref REF \
+  --output-dir DIR \
+  [--dirty error|workspace] \
+  [-c PATH]
+```
+
+This mode owns the complete comparison lifecycle. `--output-dir` requires
+`--base-ref` and is mutually exclusive with the low-level snapshot paths,
+change manifest, single output path, tier switches, and format selection. The
+default dirty policy is `error`.
+
+The command performs only direct `git` and `cargo` process invocations. It does
+not invoke a shell, fetch, mutate remotes, change the caller's branch or index,
+or provide a user-command execution facility.
+
+### Git resolution and dirty state
+
+The command resolves `REF^{commit}` and `HEAD^{commit}` from the local object
+database, computes their merge base, and compares `MERGE_BASE..HEAD`. A missing
+ref fails without fetching. Missing merge-base history reports that the
+histories may be unrelated or the clone may be shallow.
+
+Before consulting snapshot caches, the command checks `git status` for tracked
+changes and non-ignored untracked paths. Git-ignored paths and paths beneath
+Cargo's effective target directory are excluded. If the output directory is
+inside the repository, that exact normalized subtree is also excluded so a
+completed generation does not make the next invocation dirty. Its parents and
+similarly named siblings remain subject to dirty detection.
+
+- `--dirty error` rejects a dirty workspace before creating or replacing
+  artifacts.
+- `--dirty workspace` continues, selects every current workspace package in
+  all three tiers, and records `widened: true` in the manifest.
+
+Dirty and Git-change validation always run, including on a snapshot cache hit.
+
+### Output directory placement
+
+A relative `--output-dir` is resolved against the invocation working directory
+and normalized before validation, dirty filtering, cache lookup, or writes. An
+output directory outside the repository is allowed unless it is the repository
+root's ancestor.
+
+Inside the repository, the output location must be a dedicated subtree with no
+tracked content. The command rejects a location that:
+
+- is the Git root or one of its ancestors;
+- is inside `.git`;
+- traverses a symlink within the repository; or
+- contains a tracked path or is nested beneath a tracked file or Gitlink.
+
+Therefore an untracked artifact directory may be placed beneath a source
+parent, but it cannot overlap tracked source. Only the exact output subtree is
+reserved and excluded from dirty detection; an unrelated untracked path still
+causes `--dirty error` to fail or `--dirty workspace` to widen.
+
+### Commit snapshots and widening
+
+Each uncached snapshot is generated from a unique detached temporary Git
+worktree for its exact commit. The current snapshot therefore always
+corresponds to `HEAD`, even under `--dirty workspace`; caller working-tree
+content never enters it. Temporary worktrees are removed on both success and
+failure. A cleanup error is surfaced, and when generation already failed the
+primary error is retained alongside the cleanup error.
+
+The corresponding Cargo workspace is found by its Git-root-relative path. If
+the merge base predates that workspace, the baseline artifact is an empty
+schema-1 snapshot and every current package is selected in all tiers with
+`widened: true`. Other baseline Cargo metadata failures remain errors.
+
+### Snapshot cache
+
+`DIR/snapshots/baseline.json` and `DIR/snapshots/current.json` are reused only
+when the previous manifest matches the snapshot's:
+
+- exact commit;
+- canonical effective configuration content;
+- Cargo workspace path;
+- snapshot schema; and
+- cargo-delta version.
+
+The cached bytes must also match the size and SHA-256 recorded by the previous
+manifest and deserialize as a valid supported snapshot. Otherwise the snapshot
+is regenerated.
+
+### Artifact directory
+
+The command writes:
+
+```text
+DIR/
+  impact.json
+  modified.packages
+  affected.packages
+  required.packages
+  snapshots/
+    baseline.json
+    current.json
+  manifest.json
+```
+
+`impact.json` contains all three sorted name-based JSON tiers.
+`*.packages` contains sorted canonical `name@version` specs with one LF
+newline per entry; an empty tier is a present zero-byte file. JSON artifacts
+are pretty-printed and LF-terminated. Repository-relative paths and manifest
+file keys always use `/`.
+
+Every artifact is atomically replaced. `manifest.json` is replaced last and
+records the resolved commits, merge base, dirty policy, widening state,
+snapshot cache identities, deterministic generation identity, and SHA-256 plus
+byte length for every other artifact. A reader must read the manifest and
+verify those file records. During concurrent replacement it may observe a hash
+mismatch and retry, but it cannot mistake a partially generated directory for
+the published generation. A failure before the final replacement never
+publishes a new manifest.
+
 ## Compatibility and errors
 
 - The `analyze` and `run` aliases remain available.
@@ -121,11 +240,3 @@ packages deleted from the baseline are not emitted as current packages.
   usage-error status.
 - Only snapshot schema 1 is accepted. Missing, older, or newer schemas fail
   with a command that regenerates the input.
-
-## Follow-up work (not implemented)
-
-The higher-level ref-to-artifacts lifecycle is intentionally deferred. This
-change does **not** add `--output-dir`, temporary baseline worktrees, snapshot
-caches, dirty-tree policy, generation manifests, or multi-tier artifact
-directories. Those features can build on the atomic output, explicit change
-sources, stable package identity, and package-file format defined here.
