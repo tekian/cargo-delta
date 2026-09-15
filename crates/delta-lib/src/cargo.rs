@@ -6,14 +6,15 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CargoMetadata {
-    pub packages: Vec<CargoCrate>,
+    pub packages: Vec<CargoPackage>,
     pub workspace_root: PathBuf,
     pub target_directory: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CargoCrate {
+pub struct CargoPackage {
     pub name: String,
+    pub version: String,
     pub source: Option<String>,
     pub targets: Vec<CargoTarget>,
     pub manifest_path: PathBuf,
@@ -55,7 +56,7 @@ pub fn metadata(host: &mut impl Host) -> Result<CargoMetadata> {
     Ok(metadata)
 }
 
-pub fn get_workspace_crates(metadata: &CargoMetadata) -> Vec<&CargoCrate> {
+pub fn get_workspace_packages(metadata: &CargoMetadata) -> Vec<&CargoPackage> {
     metadata.packages.iter().filter(|pkg| pkg.source.is_none()).collect()
 }
 
@@ -70,6 +71,7 @@ mod tests {
         let json = serde_json::json!({
             "packages": [{
                 "name": "my-crate",
+                "version": "0.1.0",
                 "source": null,
                 "targets": [{"name": "my-crate", "kind": ["lib"], "src_path": "src/lib.rs"}],
                 "manifest_path": "Cargo.toml",
@@ -84,6 +86,7 @@ mod tests {
         let result = metadata(&mut host).unwrap();
         assert_eq!(result.packages.len(), 1);
         assert_eq!(result.packages[0].name, "my-crate");
+        assert_eq!(result.packages[0].version, "0.1.0");
     }
 
     #[test]
@@ -115,18 +118,20 @@ mod tests {
     }
 
     #[test]
-    fn get_workspace_crates_filters_external_packages() {
+    fn get_workspace_packages_filters_external_packages() {
         let meta = CargoMetadata {
             packages: vec![
-                CargoCrate {
+                CargoPackage {
                     name: "local".to_string(),
+                    version: "0.1.0".to_string(),
                     source: None,
                     targets: vec![],
                     manifest_path: PathBuf::from("Cargo.toml"),
                     dependencies: vec![],
                 },
-                CargoCrate {
+                CargoPackage {
                     name: "external".to_string(),
+                    version: "1.0.0".to_string(),
                     source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
                     targets: vec![],
                     manifest_path: PathBuf::from("Cargo.toml"),
@@ -137,7 +142,7 @@ mod tests {
             target_directory: PathBuf::from("target"),
         };
 
-        let result = get_workspace_crates(&meta);
+        let result = get_workspace_packages(&meta);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "local");
     }

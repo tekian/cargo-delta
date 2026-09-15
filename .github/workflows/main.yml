@@ -183,6 +183,9 @@ jobs:
 
   coverage:
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -205,6 +208,9 @@ jobs:
       - name: Upload Coverage to Codecov
         uses: codecov/codecov-action@v5.5.2
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov-all.info
+          slug: tekian/cargo-delta
+          use_oidc: true
+          use_pypi: true
+          version: v11.3.1
           fail_ci_if_error: true
