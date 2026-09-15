@@ -12,6 +12,7 @@ use crate::{
     config::{MainConfig, ParserConfig},
     error::Result,
     host::Host,
+    packages::PackageId,
     utils,
 };
 
@@ -50,6 +51,8 @@ pub struct FileNode {
     #[serde(with = "portable_path")]
     pub path: PathBuf,
     pub kind: FileKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<PackageId>,
     pub children: Vec<FileNode>,
 }
 
@@ -58,6 +61,16 @@ impl FileNode {
         Self {
             path,
             kind,
+            package: None,
+            children: Vec::new(),
+        }
+    }
+
+    pub const fn for_package(path: PathBuf, package: PackageId) -> Self {
+        Self {
+            path,
+            kind: FileKind::Package,
+            package: Some(package),
             children: Vec::new(),
         }
     }
@@ -98,21 +111,19 @@ impl FileNode {
         paths
     }
 
-    pub fn find_package_manifests_containing_file(&self, target_file: &PathBuf) -> Vec<PathBuf> {
-        fn visit(node: &FileNode, target_file: &PathBuf, current_package: Option<&Path>, results: &mut Vec<PathBuf>) {
+    pub fn find_packages_containing_file(&self, target_file: &PathBuf) -> Vec<PackageId> {
+        fn visit(node: &FileNode, target_file: &PathBuf, current_package: Option<&PackageId>, results: &mut Vec<PackageId>) {
             let current_package = if matches!(node.kind, FileKind::Package) {
-                Some(node.path.as_path())
+                node.package.as_ref()
             } else {
                 current_package
             };
 
             if &node.path == target_file
-                && let Some(package_manifest) = current_package
+                && let Some(package) = current_package
+                && !results.contains(package)
             {
-                let package_manifest = package_manifest.to_path_buf();
-                if !results.contains(&package_manifest) {
-                    results.push(package_manifest);
-                }
+                results.push(package.clone());
             }
 
             for child in &node.children {
@@ -470,7 +481,7 @@ pub fn build_tree(host: &mut impl Host, metadata: &CargoMetadata, packages: &[&C
     let mut root_node = FileNode::new(root_path, root_kind);
 
     for package in packages {
-        let mut node = FileNode::new(package.manifest_path.clone(), FileKind::Package);
+        let mut node = FileNode::for_package(package.manifest_path.clone(), PackageId::new(&package.name, &package.version));
 
         for target in &package.targets {
             let mut target_node = FileNode::new(target.src_path.clone(), FileKind::Target);
@@ -595,22 +606,23 @@ mod tests {
     }
 
     #[test]
-    fn find_package_manifests_containing_file_finds_match() {
+    fn find_packages_containing_file_finds_match() {
         let mut root = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
-        let mut package_node = FileNode::new(PathBuf::from("my-package/Cargo.toml"), FileKind::Package);
+        let package = PackageId::new("my-package", "0.1.0");
+        let mut package_node = FileNode::for_package(PathBuf::from("my-package/Cargo.toml"), package.clone());
         package_node.add_child(FileNode::new(PathBuf::from("my-package/src/lib.rs"), FileKind::Target));
         root.add_child(package_node);
 
         let target = PathBuf::from("my-package/src/lib.rs");
-        let packages = root.find_package_manifests_containing_file(&target);
-        assert_eq!(packages, vec![PathBuf::from("my-package/Cargo.toml")]);
+        let packages = root.find_packages_containing_file(&target);
+        assert_eq!(packages, vec![package]);
     }
 
     #[test]
-    fn find_package_manifests_containing_file_returns_empty_for_no_match() {
+    fn find_packages_containing_file_returns_empty_for_no_match() {
         let root = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
         let target = PathBuf::from("nonexistent.rs");
-        let packages = root.find_package_manifests_containing_file(&target);
+        let packages = root.find_packages_containing_file(&target);
         assert!(packages.is_empty());
     }
 

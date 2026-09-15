@@ -286,35 +286,21 @@ name and version. A package may build multiple Rust crates or targets, but
 cargo-delta computes impact between packages because that is the unit Cargo's
 `-p`/`--package` interface can consume.
 
-Schema `1` has three data fields:
+Schema `1` has two data fields:
 
-- **`packages`** describes each workspace member by package name, version, and
-  Git-root-relative manifest path. The manifest path is its stable snapshot
-  identity.
 - **`files`** is the recursive input tree. Its nodes represent manifests,
   Cargo targets, Rust modules, `include!` inputs, configured file references,
-  and assumed inputs. A package-root node's path identifies its owner.
-- **`dependencies`** maps each package manifest path to the manifest paths of
-  its direct workspace dependencies. cargo-delta traverses it in both
-  directions to compute affected and required sets.
+  and assumed inputs. Each package-root node records its `name@version`
+  package ID.
+- **`packages`** maps each workspace package ID to the IDs of its direct
+  workspace dependencies. cargo-delta traverses it in both directions to
+  compute affected and required sets.
 
 For example, a two-package workspace snapshot starts like this:
 
 ```json
 {
   "schema": 1,
-  "packages": [
-    {
-      "name": "app",
-      "version": "1.0.0",
-      "manifest_path": "crates/app/Cargo.toml"
-    },
-    {
-      "name": "core",
-      "version": "1.0.0",
-      "manifest_path": "crates/core/Cargo.toml"
-    }
-  ],
   "files": {
     "path": "Cargo.toml",
     "kind": "Workspace",
@@ -322,15 +308,16 @@ For example, a two-package workspace snapshot starts like this:
       {
         "path": "crates/app/Cargo.toml",
         "kind": "Package",
+        "package": "app@1.0.0",
         "children": []
       }
     ]
   },
-  "dependencies": {
-    "crates/app/Cargo.toml": [
-      "crates/core/Cargo.toml"
+  "packages": {
+    "app@1.0.0": [
+      "core@1.0.0"
     ],
-    "crates/core/Cargo.toml": []
+    "core@1.0.0": []
   }
 }
 ```
