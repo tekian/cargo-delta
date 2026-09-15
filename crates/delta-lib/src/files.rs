@@ -501,6 +501,7 @@ pub fn build_tree(host: &mut impl Host, metadata: &CargoMetadata, packages: &[&C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::TestHost;
 
     #[test]
     fn new_file_node_has_no_children() {
@@ -600,6 +601,42 @@ mod tests {
         let target = PathBuf::from("nonexistent.rs");
         let packages = root.find_packages_containing_file(&target);
         assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn build_tree_adds_files_matching_nonempty_assume_patterns() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-assume-patterns-{}", std::process::id()));
+        let package_root = root.join("package");
+        fs::create_dir_all(&package_root).unwrap();
+        let assumed_file = package_root.join("schema.proto");
+        fs::write(&assumed_file, "message Example {}").unwrap();
+        let metadata = CargoMetadata {
+            packages: vec![CargoPackage {
+                name: "package".to_string(),
+                version: "0.1.0".to_string(),
+                source: None,
+                targets: Vec::new(),
+                manifest_path: package_root.join("Cargo.toml"),
+                dependencies: Vec::new(),
+            }],
+            workspace_root: root.clone(),
+            target_directory: root.join("target"),
+        };
+        let config = MainConfig {
+            parser: ParserConfig {
+                assume: true,
+                assume_patterns: HashSet::from(["*.proto".to_string()]),
+                ..ParserConfig::default()
+            },
+            ..MainConfig::default()
+        };
+
+        let tree = build_tree(&mut TestHost::new(), &metadata, &[&metadata.packages[0]], &config);
+
+        assert_eq!(tree.children[0].children.len(), 1);
+        assert_eq!(tree.children[0].children[0].kind, FileKind::Assume);
+        assert_eq!(tree.children[0].children[0].path, assumed_file);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

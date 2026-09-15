@@ -1242,6 +1242,38 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
+    fn snapshot_stops_after_output_write_failure() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-snapshot-write-failure-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let metadata = CargoMetadata {
+            packages: Vec::new(),
+            workspace_root: root.clone(),
+            target_directory: root.join("target"),
+        };
+        let mut host = TestHost::new().with_commands(vec![
+            Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
+            Ok(success_output(&format!("{}\n", root.display()))),
+        ]);
+
+        run(
+            &mut host,
+            [
+                "cargo".to_string(),
+                "delta".to_string(),
+                "snapshot".to_string(),
+                "--output".to_string(),
+                root.display().to_string(),
+            ],
+        );
+
+        assert_eq!(host.exit_code, Some(1));
+        assert!(host.stderr_str().contains("Error writing output"));
+        assert!(!host.stderr_str().contains("Snapshot finished"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn run_subcommand_no_changes_exits_zero() {
         let mut host = TestHost::new().with_commands(vec![
             Ok(success_output("/fake/root\n")),             // git rev-parse
@@ -1326,5 +1358,46 @@ mod tests {
         assert!(stdout.contains("lib"));
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn impact_stops_after_output_write_failure() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-impact-write-failure-{}", std::process::id()));
+        fs::create_dir_all(root.join("lib/src")).unwrap();
+        fs::write(root.join("lib/src/lib.rs"), "pub fn value() {}\n").unwrap();
+        let tree = make_workspace(&[("lib", &["lib/src/lib.rs"], &[])]);
+        let snapshot = serde_json::to_string_pretty(&tree).unwrap();
+        let baseline = root.join("baseline.json");
+        let current = root.join("current.json");
+        fs::write(&baseline, &snapshot).unwrap();
+        fs::write(&current, &snapshot).unwrap();
+        let mut host = TestHost::new().with_commands(vec![
+            Ok(success_output(&format!("{}\n", root.display()))),
+            Ok(success_output("abc123\n")),
+            Ok(success_output("lib/src/lib.rs\n")),
+        ]);
+
+        run(
+            &mut host,
+            [
+                "cargo".to_string(),
+                "delta".to_string(),
+                "impact".to_string(),
+                "--baseline".to_string(),
+                baseline.display().to_string(),
+                "--current".to_string(),
+                current.display().to_string(),
+                "--base-ref".to_string(),
+                "origin/main".to_string(),
+                "--output".to_string(),
+                root.display().to_string(),
+            ],
+        );
+
+        assert_eq!(host.exit_code, Some(1));
+        assert!(host.stderr_str().contains("Error writing output"));
+        assert!(!host.stderr_str().contains("Modified"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
