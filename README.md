@@ -343,6 +343,7 @@ cargo delta impact --baseline main.json --current feature.json --base-ref origin
 | `cargo-args-versioned` | One line of `-p NAME@VERSION` arguments. |
 | `cargo-excludes` | One line of `--exclude NAME` arguments for unselected workspace packages. |
 | `cargo-excludes-versioned` | One line of `--exclude NAME@VERSION` arguments for unselected workspace packages. |
+| `gamma-test-packages` | One line of repeated `--test-package NAME` arguments for `cargo gamma run`. |
 | `packages` | One `name@version` package ID per line. |
 
 Use `--output PATH` to write the same output directly instead of relying on

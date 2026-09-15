@@ -128,6 +128,8 @@ enum OutputFormat {
     CargoExcludes,
     /// Space-separated `--exclude NAME@VERSION` arguments for the workspace complement.
     CargoExcludesVersioned,
+    /// Space-separated `--test-package NAME` arguments for `cargo gamma run`.
+    GammaTestPackages,
     /// One canonical `name@version` package ID per line.
     Packages,
 }
@@ -478,6 +480,14 @@ fn emit_result(
             let joined = unselected
                 .into_iter()
                 .map(|name| format!("--exclude {name}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines(core::iter::once(joined).filter(|value| !value.is_empty()))
+        }
+        OutputFormat::GammaTestPackages => {
+            let joined = selected
+                .iter()
+                .map(|package| format!("--test-package {}", package_name(package)))
                 .collect::<Vec<_>>()
                 .join(" ");
             lines(core::iter::once(joined).filter(|value| !value.is_empty()))
@@ -1149,6 +1159,23 @@ mod tests {
 
         assert!(ok);
         assert_eq!(host.stdout_str(), "a@0.1.0\nb@0.1.0\nc@0.1.0\n");
+    }
+
+    #[test]
+    fn emit_result_gamma_test_packages_emits_repeated_package_arguments() {
+        let mut host = TestHost::new();
+
+        let ok = emit_result(
+            &mut host,
+            &sample_impact(),
+            &sample_workspace(),
+            OutputFormat::GammaTestPackages,
+            all_tiers(),
+            None,
+        );
+
+        assert!(ok);
+        assert_eq!(host.stdout_str(), "--test-package a --test-package b --test-package c\n");
     }
 
     #[test]
