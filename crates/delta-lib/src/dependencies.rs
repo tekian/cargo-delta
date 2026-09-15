@@ -1,4 +1,4 @@
-use crate::cargo::CargoMetadata;
+use crate::cargo::CargoPackage;
 use normpath::PathExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -12,23 +12,21 @@ pub struct PackageDependencies {
     dependencies: BTreeMap<String, Vec<String>>,
 }
 
-pub fn parse(metadata: &CargoMetadata) -> Result<PackageDependencies> {
-    let workspace: HashSet<&str> = metadata.workspace_members.iter().map(String::as_str).collect();
-    let workspace_packages: Vec<_> = metadata
-        .packages
+pub fn parse(packages: &[&CargoPackage], git_root: &Path) -> Result<PackageDependencies> {
+    let workspace_packages = packages
         .iter()
-        .filter(|package| workspace.contains(package.id.as_str()))
-        .collect();
+        .map(|package| Ok((*package, crate::package_manifest_path(package, git_root)?)))
+        .collect::<Result<Vec<_>>>()?;
     let mut dependencies = BTreeMap::new();
 
-    for package_id in &metadata.workspace_members {
-        let _ = dependencies.insert(package_id.clone(), Vec::new());
+    for (_, manifest_path) in &workspace_packages {
+        let _ = dependencies.insert(manifest_path.clone(), Vec::new());
     }
 
-    for package in &workspace_packages {
+    for (package, manifest_path) in &workspace_packages {
         let package_deps = dependencies
-            .get_mut(&package.id)
-            .ok_or_else(|| Error::Other(format!("Cargo package '{}' is not a workspace member", package.id)))?;
+            .get_mut(manifest_path)
+            .ok_or_else(|| Error::Other(format!("Package manifest '{manifest_path}' is not a workspace member")))?;
         for dependency in &package.dependencies {
             if dependency.source.is_some() {
                 continue;
@@ -36,15 +34,15 @@ pub fn parse(metadata: &CargoMetadata) -> Result<PackageDependencies> {
 
             let matches: Vec<_> = workspace_packages
                 .iter()
-                .filter(|candidate| dependency_matches(dependency.path.as_deref(), &dependency.name, candidate))
+                .filter(|(candidate, _)| dependency_matches(dependency.path.as_deref(), &dependency.name, candidate))
                 .collect();
             match matches.as_slice() {
                 [] => {}
-                [dependency_package] => package_deps.push(dependency_package.id.clone()),
+                [(_, dependency_manifest)] => package_deps.push(dependency_manifest.clone()),
                 _ => {
                     return Err(Error::Other(format!(
-                        "Workspace dependency '{}' of package '{}' does not map to exactly one Cargo package ID",
-                        dependency.name, package.id
+                        "Workspace dependency '{}' of package manifest '{}' does not map to exactly one workspace package",
+                        dependency.name, manifest_path
                     )));
                 }
             }
@@ -56,7 +54,7 @@ pub fn parse(metadata: &CargoMetadata) -> Result<PackageDependencies> {
     Ok(PackageDependencies { dependencies })
 }
 
-fn dependency_matches(dependency_path: Option<&Path>, dependency_name: &str, package: &crate::cargo::CargoPackage) -> bool {
+fn dependency_matches(dependency_path: Option<&Path>, dependency_name: &str, package: &CargoPackage) -> bool {
     if let Some(dependency_path) = dependency_path {
         let Some(package_directory) = package.manifest_path.parent() else {
             return false;
@@ -77,19 +75,20 @@ impl PackageDependencies {
             dependencies: BTreeMap::new(),
         }
     }
-    pub fn get_dependencies(&self, package_id: &str) -> Option<&Vec<String>> {
-        self.dependencies.get(package_id)
+
+    pub fn get_dependencies(&self, package_manifest: &str) -> Option<&Vec<String>> {
+        self.dependencies.get(package_manifest)
     }
 
-    pub fn get_dependents(&self, package_id: &str) -> Option<Vec<String>> {
-        if !self.dependencies.contains_key(package_id) {
+    pub fn get_dependents(&self, package_manifest: &str) -> Option<Vec<String>> {
+        if !self.dependencies.contains_key(package_manifest) {
             return None;
         }
 
         let mut dependents = Vec::new();
 
         for (name, deps) in &self.dependencies {
-            if deps.iter().any(|dependency| dependency == package_id) {
+            if deps.iter().any(|dependency| dependency == package_manifest) {
                 dependents.push(name.clone());
             }
         }
@@ -97,13 +96,13 @@ impl PackageDependencies {
         Some(dependents)
     }
 
-    pub fn get_dependencies_transitive(&self, package_id: &str) -> Option<Vec<String>> {
-        if !self.dependencies.contains_key(package_id) {
+    pub fn get_dependencies_transitive(&self, package_manifest: &str) -> Option<Vec<String>> {
+        if !self.dependencies.contains_key(package_manifest) {
             return None;
         }
 
         let mut all_dependencies = HashSet::new();
-        let mut to_visit = vec![package_id.to_string()];
+        let mut to_visit = vec![package_manifest.to_string()];
         let mut visited = HashSet::new();
 
         while let Some(current_package) = to_visit.pop() {
@@ -124,13 +123,13 @@ impl PackageDependencies {
         Some(all_dependencies.into_iter().collect())
     }
 
-    pub fn get_dependents_transitive(&self, package_id: &str) -> Option<Vec<String>> {
-        if !self.dependencies.contains_key(package_id) {
+    pub fn get_dependents_transitive(&self, package_manifest: &str) -> Option<Vec<String>> {
+        if !self.dependencies.contains_key(package_manifest) {
             return None;
         }
 
         let mut all_dependents = HashSet::new();
-        let mut to_visit = vec![package_id.to_string()];
+        let mut to_visit = vec![package_manifest.to_string()];
         let mut visited = HashSet::new();
 
         while let Some(current_package) = to_visit.pop() {
@@ -155,7 +154,7 @@ impl PackageDependencies {
         self.dependencies.len()
     }
 
-    pub fn get_all_package_ids(&self) -> Vec<String> {
+    pub fn get_all_package_manifests(&self) -> Vec<String> {
         self.dependencies.keys().cloned().collect()
     }
 }
@@ -252,9 +251,9 @@ mod tests {
     }
 
     #[test]
-    fn get_all_package_ids_returns_all() {
+    fn get_all_package_manifests_returns_all() {
         let c = make_dependencies(&[("alpha", &[]), ("beta", &[])]);
-        let mut names = c.get_all_package_ids();
+        let mut names = c.get_all_package_manifests();
         names.sort();
         assert_eq!(names, vec!["alpha", "beta"]);
     }
