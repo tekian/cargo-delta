@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -16,6 +17,9 @@ pub trait Host: Send + Sync {
     /// Return the directory from which the tool was invoked.
     fn current_dir(&self) -> io::Result<PathBuf>;
 
+    /// Read an operating-system environment variable.
+    fn env_var_os(&self, key: &str) -> Option<OsString>;
+
     /// Run an external command and return its output.
-    fn run_command(&mut self, command: &str, args: &[&str], working_dir: Option<&Path>) -> io::Result<Output>;
+    fn run_command(&mut self, command: impl AsRef<OsStr>, args: &[&str], working_dir: Option<&Path>) -> io::Result<Output>;
 }

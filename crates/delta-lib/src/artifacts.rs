@@ -736,6 +736,7 @@ fn portable_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::test_helpers::test_directory;
+    use std::ffi::{OsStr, OsString};
     use std::process::{Command, Output};
 
     #[derive(Debug)]
@@ -789,9 +790,14 @@ mod tests {
             Ok(self.current_dir.clone())
         }
 
-        fn run_command(&mut self, command: &str, args: &[&str], working_dir: Option<&Path>) -> io::Result<Output> {
+        fn env_var_os(&self, key: &str) -> Option<OsString> {
+            std::env::var_os(key)
+        }
+
+        fn run_command(&mut self, command: impl AsRef<OsStr>, args: &[&str], working_dir: Option<&Path>) -> io::Result<Output> {
+            let command = command.as_ref();
             self.command_calls.push((
-                command.to_string(),
+                command.to_string_lossy().into_owned(),
                 args.iter().map(|arg| (*arg).to_string()).collect(),
                 working_dir.map(Path::to_path_buf),
             ));

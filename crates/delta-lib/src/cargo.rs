@@ -3,6 +3,7 @@ use crate::host::Host;
 use normpath::PathExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +41,8 @@ pub struct CargoDependency {
 
 /// Get Cargo metadata from the requested working directory.
 pub fn metadata(host: &mut impl Host, working_dir: Option<&std::path::Path>) -> Result<CargoMetadata> {
-    let output = host.run_command("cargo", &["metadata", "--format-version", "1", "--no-deps"], working_dir)?;
+    let cargo = cargo_executable(host);
+    let output = host.run_command(&cargo, &["metadata", "--format-version", "1", "--no-deps"], working_dir)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -58,6 +60,12 @@ pub fn metadata(host: &mut impl Host, working_dir: Option<&std::path::Path>) -> 
         .unwrap_or(metadata.workspace_root);
 
     Ok(metadata)
+}
+
+fn cargo_executable(host: &impl Host) -> OsString {
+    host.env_var_os("CARGO")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsStr::new("cargo").to_os_string())
 }
 
 pub fn get_workspace_packages(metadata: &CargoMetadata) -> Vec<&CargoPackage> {
@@ -94,6 +102,44 @@ mod tests {
         assert_eq!(result.packages.len(), 1);
         assert_eq!(result.packages[0].name, "my-crate");
         assert_eq!(result.packages[0].version, "0.1.0");
+        assert_eq!(host.command_calls[0].command, "cargo");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn metadata_uses_cargo_executable_from_environment() {
+        let cargo = PathBuf::from("toolchains").join("MS Rust").join("cargo");
+        let json = serde_json::json!({
+            "packages": [],
+            "workspace_members": [],
+            "workspace_root": ".",
+            "target_directory": "target"
+        });
+        let mut host = TestHost::new()
+            .with_env_var("CARGO", cargo.clone())
+            .with_commands(vec![Ok(success_output(&json.to_string()))]);
+
+        let _ = metadata(&mut host, None).unwrap();
+
+        assert_eq!(host.command_calls[0].command, cargo.to_string_lossy());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn metadata_ignores_empty_cargo_environment_value() {
+        let json = serde_json::json!({
+            "packages": [],
+            "workspace_members": [],
+            "workspace_root": ".",
+            "target_directory": "target"
+        });
+        let mut host = TestHost::new()
+            .with_env_var("CARGO", OsString::new())
+            .with_commands(vec![Ok(success_output(&json.to_string()))]);
+
+        let _ = metadata(&mut host, None).unwrap();
+
+        assert_eq!(host.command_calls[0].command, "cargo");
     }
 
     #[test]
