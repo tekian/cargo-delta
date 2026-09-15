@@ -665,7 +665,7 @@ fn unique_worktree_path(parent: &Path) -> Result<PathBuf> {
 }
 
 fn all_packages_impact(current: &WorkspaceTree) -> Impact {
-    let packages: HashSet<String> = current.dependencies.get_all_package_ids().into_iter().collect();
+    let packages: HashSet<String> = current.dependencies.get_all_package_manifests().into_iter().collect();
     Impact {
         modified: packages.clone(),
         affected: packages.clone(),
