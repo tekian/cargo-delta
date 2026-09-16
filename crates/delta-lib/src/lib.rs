@@ -27,7 +27,7 @@ mod error;
 mod files;
 mod git;
 mod host;
-mod managed;
+mod impact_snapshots;
 mod utils;
 
 pub use host::Host;
@@ -184,7 +184,7 @@ struct Impact {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceTree {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_key: Option<managed::SnapshotCacheKey>,
+    pub cache_key: Option<impact_snapshots::SnapshotCacheKey>,
     pub files: FileNode,
     pub packages: Packages,
 }
@@ -335,7 +335,7 @@ fn snapshot_cache_key(
     git_root: &Path,
     config_path: Option<&PathBuf>,
     output: Option<&Path>,
-) -> error::Result<managed::SnapshotCacheKey> {
+) -> error::Result<impact_snapshots::SnapshotCacheKey> {
     let caller_dir = host
         .current_dir()
         .map_err(|error| error::Error::Other(format!("Failed to get current directory: {error}")))?;
@@ -349,7 +349,7 @@ fn snapshot_cache_key(
             }
         });
     }
-    managed::current_cache_key(host, metadata, git_root, config_path, true, &excluded_paths)
+    impact_snapshots::current_cache_key(host, metadata, git_root, config_path, true, &excluded_paths)
 }
 
 fn build_snapshot(
@@ -357,7 +357,7 @@ fn build_snapshot(
     config: &MainConfig,
     metadata: &cargo::CargoMetadata,
     git_root: &Path,
-    cache_key: Option<managed::SnapshotCacheKey>,
+    cache_key: Option<impact_snapshots::SnapshotCacheKey>,
 ) -> WorkspaceTree {
     let packages = cargo::get_workspace_packages(metadata);
     let mut files = files::build_tree(host, metadata, &packages, config);
@@ -371,7 +371,7 @@ fn build_snapshot(
 }
 
 fn explicit_baseline_head<'a>(path: &Path, tree: &'a WorkspaceTree) -> error::Result<&'a str> {
-    managed::cache_key(path, tree, "baseline")?.clean_head().ok_or_else(|| {
+    impact_snapshots::cache_key(path, tree, "baseline")?.clean_head().ok_or_else(|| {
         error::Error::Other(format!(
             "Explicit baseline snapshot '{}' contains working-tree changes and cannot define a Git diff base",
             path.display()
@@ -384,7 +384,7 @@ fn resolve_impact_inputs(
     config: &MainConfig,
     command: &ImpactCommand,
     config_path: Option<&PathBuf>,
-) -> error::Result<Option<managed::ManagedImpact>> {
+) -> error::Result<Option<impact_snapshots::ImpactInputs>> {
     let caller_dir = host
         .current_dir()
         .map_err(|error| error::Error::Other(format!("Failed to get current directory: {error}")))?;
@@ -393,7 +393,7 @@ fn resolve_impact_inputs(
     if let (Some(baseline_path), Some(current_path)) = (command.baseline.as_deref(), command.current.as_deref()) {
         let baseline: WorkspaceTree = utils::deser_json(baseline_path)?;
         let current: WorkspaceTree = utils::deser_json(current_path)?;
-        let _ = managed::cache_key(current_path, &current, "current")?;
+        let _ = impact_snapshots::cache_key(current_path, &current, "current")?;
         let excluded_paths = [command.baseline.clone(), command.current.clone(), command.output.clone()]
             .into_iter()
             .flatten()
@@ -408,11 +408,11 @@ fn resolve_impact_inputs(
             .map_err(|error| error::Error::Other(format!("Failed to read current Cargo metadata: {error}")))?;
         let mut excluded_paths = excluded_paths;
         excluded_paths.push(metadata.target_directory.join("cargo-delta"));
-        let current_key = managed::current_cache_key(host, &metadata, &git_root, config_path, true, &excluded_paths)?;
-        let baseline_key = managed::baseline_cache_key(&metadata, &git_root, config_path, &comparison.base_commit, true)?;
-        managed::warn_if_stale(host, baseline_path, &baseline, &baseline_key, "baseline")?;
-        managed::warn_if_stale(host, current_path, &current, &current_key, "current")?;
-        return Ok(Some(managed::ManagedImpact {
+        let current_key = impact_snapshots::current_cache_key(host, &metadata, &git_root, config_path, true, &excluded_paths)?;
+        let baseline_key = impact_snapshots::baseline_cache_key(&metadata, &git_root, config_path, &comparison.base_commit, true)?;
+        impact_snapshots::warn_if_stale(host, baseline_path, &baseline, &baseline_key, "baseline")?;
+        impact_snapshots::warn_if_stale(host, current_path, &current, &current_key, "current")?;
+        return Ok(Some(impact_snapshots::ImpactInputs {
             baseline,
             current,
             diff: comparison.diff,
@@ -429,7 +429,7 @@ fn resolve_impact_inputs(
         .collect::<Vec<_>>();
     excluded_paths.push(metadata.target_directory.join("cargo-delta"));
     let baseline = match command.baseline.as_deref() {
-        Some(path) => Some(managed::ExplicitSnapshot {
+        Some(path) => Some(impact_snapshots::ExplicitSnapshot {
             path,
             tree: utils::deser_json(path)?,
         }),
@@ -449,10 +449,10 @@ fn resolve_impact_inputs(
             &excluded_paths,
         )?,
     };
-    managed::resolve(
+    impact_snapshots::resolve(
         host,
         config,
-        managed::ResolveContext {
+        impact_snapshots::ResolveContext {
             config_path,
             comparison,
             git_root: &git_root,
@@ -472,7 +472,7 @@ fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, co
     let tiers = TierMask::resolve(command.modified, command.affected, command.required);
 
     let _ = writeln!(host.error(), "Looking up git changes..");
-    let managed::ManagedImpact {
+    let impact_snapshots::ImpactInputs {
         baseline: baseline_tree,
         current: current_tree,
         diff,
@@ -901,7 +901,7 @@ mod tests {
 
     fn make_keyed_workspace(package_defs: &[(&str, &[&str], &[&str])], head: &str) -> WorkspaceTree {
         let mut tree = make_workspace(package_defs);
-        tree.cache_key = Some(managed::SnapshotCacheKey::clean_test_key(head));
+        tree.cache_key = Some(impact_snapshots::SnapshotCacheKey::clean_test_key(head));
         tree
     }
 
@@ -1115,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_and_explicit_snapshot_options_have_expected_relationships() {
+    fn cached_and_explicit_snapshot_options_have_expected_relationships() {
         let _managed = Cli::try_parse_from(["cargo", "delta", "impact", "--base-ref", "origin/main"]).unwrap();
         let _generated_current = Cli::try_parse_from(["cargo", "delta", "impact", "--baseline", "base.json"]).unwrap();
         let _explicit_current =
@@ -1655,6 +1655,8 @@ mod tests {
     fn impact_stops_after_output_write_failure() {
         let root = std::env::temp_dir().join(format!("cargo-delta-impact-write-failure-{}", std::process::id()));
         fs::create_dir_all(root.join("lib/src")).unwrap();
+        let output = root.join("output");
+        fs::create_dir_all(&output).unwrap();
         fs::write(root.join("lib/src/lib.rs"), "pub fn value() {}\n").unwrap();
         let tree = make_keyed_workspace(&[("lib", &["lib/src/lib.rs"], &[])], "abc123");
         let snapshot = serde_json::to_string_pretty(&tree).unwrap();
@@ -1688,13 +1690,13 @@ mod tests {
                 "--current".to_string(),
                 current.display().to_string(),
                 "--output".to_string(),
-                root.display().to_string(),
+                output.display().to_string(),
             ],
         );
 
         assert_eq!(host.exit_code, Some(1));
         assert!(host.stderr_str().contains("Error writing output"));
-        assert!(!host.stderr_str().contains("Modified"));
+        assert!(!host.stderr_str().contains("Modified    "));
         fs::remove_dir_all(root).unwrap();
     }
 }

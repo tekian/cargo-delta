@@ -65,7 +65,7 @@ struct SnapshotSource {
     working_tree_sha256: String,
 }
 
-pub struct ManagedImpact {
+pub struct ImpactInputs {
     pub baseline: WorkspaceTree,
     pub current: WorkspaceTree,
     pub diff: crate::git::GitDiff,
@@ -128,7 +128,7 @@ pub fn baseline_cache_key(
     })
 }
 
-pub fn resolve(host: &mut impl Host, config: &MainConfig, context: ResolveContext<'_>) -> Result<ManagedImpact> {
+pub fn resolve(host: &mut impl Host, config: &MainConfig, context: ResolveContext<'_>) -> Result<ImpactInputs> {
     let ResolveContext {
         config_path,
         comparison,
@@ -164,7 +164,7 @@ pub fn resolve(host: &mut impl Host, config: &MainConfig, context: ResolveContex
         )?,
     };
     let widen = baseline.cache_key.as_ref().is_some_and(|key| !key.workspace_present);
-    Ok(ManagedImpact {
+    Ok(ImpactInputs {
         baseline,
         current,
         diff: comparison.diff,
@@ -398,6 +398,13 @@ mod tests {
                 .filter(|(command, args)| command == "git" && args.starts_with(&["worktree".to_string(), "add".to_string()]))
                 .count()
         }
+
+        fn worktree_removes(&self) -> usize {
+            self.command_calls
+                .iter()
+                .filter(|(command, args)| command == "git" && args.starts_with(&["worktree".to_string(), "remove".to_string()]))
+                .count()
+        }
     }
 
     impl Host for ProcessHost {
@@ -461,7 +468,7 @@ mod tests {
     }
 
     fn repository(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("cargo-delta-managed-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("cargo-delta-impact-snapshots-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "--initial-branch=main"]);
@@ -478,7 +485,7 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"lib\"]\nresolver = \"2\"\n").unwrap();
         fs::write(
             root.join("lib/Cargo.toml"),
-            "[package]\nname = \"managed-lib\"\nversion = \"1.2.3\"\nedition = \"2024\"\n",
+            "[package]\nname = \"workspace-lib\"\nversion = \"1.2.3\"\nedition = \"2024\"\n",
         )
         .unwrap();
         fs::write(root.join("lib/src/lib.rs"), format!("pub fn value() -> u32 {{ {value} }}\n")).unwrap();
@@ -541,7 +548,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn managed_impact_reuses_baseline_and_current_until_worktree_content_changes() {
+    fn cached_impact_reuses_baseline_and_current_until_worktree_content_changes() {
         let root = repository("cache");
         let workspace = root.join("rust");
         write_workspace(&workspace, 1);
@@ -562,8 +569,9 @@ mod tests {
 
         let first = invoke(&caller_workspace, &output);
         assert_eq!(first.exit_code, None, "{}", first.stderr());
-        assert_eq!(fs::read_to_string(&output_file).unwrap(), "managed-lib@1.2.3\n");
+        assert_eq!(fs::read_to_string(&output_file).unwrap(), "workspace-lib@1.2.3\n");
         assert_eq!(first.worktree_adds(), 1);
+        assert_eq!(first.worktree_removes(), 1);
         let cached_current: serde_json::Value =
             serde_json::from_slice(&fs::read(workspace.join("target/cargo-delta/current.json")).unwrap()).unwrap();
         assert_eq!(
@@ -618,7 +626,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn managed_impact_with_no_changes_writes_empty_output() {
+    fn cached_impact_with_no_changes_writes_empty_output() {
         let root = repository("no-changes");
         write_workspace(&root, 1);
         commit(&root, "baseline");
@@ -648,7 +656,7 @@ mod tests {
         let host = invoke(&workspace, &output);
 
         assert_eq!(host.exit_code, None, "{}", host.stderr());
-        assert_eq!(fs::read_to_string(output).unwrap(), "managed-lib@1.2.3\n");
+        assert_eq!(fs::read_to_string(output).unwrap(), "workspace-lib@1.2.3\n");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -765,7 +773,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn snapshots_generated_explicitly_are_reused_as_managed_cache_entries() {
+    fn explicitly_generated_snapshots_are_reused_as_cache_entries() {
         let root = repository("explicit-cache-generation");
         write_workspace(&root, 1);
         commit(&root, "baseline");
@@ -825,7 +833,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn redirected_snapshot_is_reused_from_managed_current_cache_path() {
+    fn redirected_snapshot_is_reused_from_current_cache_path() {
         let root = repository("redirected-current-cache");
         fs::write(root.join(".gitignore"), "").unwrap();
         write_workspace(&root, 1);
