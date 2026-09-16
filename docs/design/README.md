@@ -18,6 +18,10 @@ The snapshot keeps the original two-part structure:
 - `files` is the detected input tree;
 - `packages` maps each workspace package to its direct workspace dependencies.
 
+Snapshot generation requires a Git worktree. Git supplies the root for portable
+relative paths and the checkout identity embedded in the snapshot key; without
+Git, the command fails without producing an artifact.
+
 Package IDs are stable `name@version` strings. Each package node in `files`
 records its owning package ID because a package name does not have to match its
 directory name.
@@ -69,6 +73,11 @@ current and regenerates it otherwise.
 Managed comparison resolves `merge-base(HEAD, REF)` and compares that commit
 with the current working tree. It includes committed, staged, unstaged,
 deleted, and non-ignored untracked paths.
+
+A cache-keyed explicit baseline defines the exact base commit from its embedded
+`HEAD`; configured-branch discovery is used only for legacy keyless snapshots.
+An explicit baseline with working-tree changes is rejected because its digest
+can validate state but cannot reconstruct those changes for a Git comparison.
 
 The baseline snapshot owns deleted-file lookups. The current snapshot owns
 changed and newly discovered files and supplies the dependency graph used for

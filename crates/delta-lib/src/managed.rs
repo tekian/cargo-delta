@@ -26,6 +26,10 @@ pub struct SnapshotCacheKey {
     workspace_present: bool,
 }
 
+fn clean_working_tree_digest() -> String {
+    format!("{:x}", Sha256::digest([0]))
+}
+
 impl SnapshotCacheKey {
     fn matches_identity(&self, other: &Self) -> bool {
         self.cache_version == other.cache_version
@@ -33,6 +37,10 @@ impl SnapshotCacheKey {
             && self.workspace == other.workspace
             && self.config_sha256 == other.config_sha256
             && self.source == other.source
+    }
+
+    pub fn clean_head(&self) -> Option<&str> {
+        (self.source.working_tree_sha256 == clean_working_tree_digest()).then_some(self.source.head.as_str())
     }
 }
 
@@ -54,9 +62,14 @@ pub struct ResolveContext<'a> {
     pub comparison: GitComparison,
     pub git_root: &'a Path,
     pub current_metadata: &'a CargoMetadata,
-    pub baseline_path: Option<&'a Path>,
+    pub baseline: Option<ExplicitSnapshot<'a>>,
     pub current_path: Option<&'a Path>,
     pub excluded_paths: &'a [PathBuf],
+}
+
+pub struct ExplicitSnapshot<'a> {
+    pub path: &'a Path,
+    pub tree: WorkspaceTree,
 }
 
 pub fn current_cache_key(
@@ -84,7 +97,7 @@ pub fn baseline_cache_key(
     metadata: &CargoMetadata,
     git_root: &Path,
     config_path: Option<&PathBuf>,
-    merge_base: &str,
+    base_commit: &str,
     workspace_present: bool,
 ) -> Result<SnapshotCacheKey> {
     Ok(SnapshotCacheKey {
@@ -93,8 +106,8 @@ pub fn baseline_cache_key(
         workspace: workspace_relative_path(metadata, git_root)?,
         config_sha256: config_digest(config_path)?,
         source: SnapshotSource {
-            head: merge_base.to_string(),
-            working_tree_sha256: format!("{:x}", Sha256::digest([0])),
+            head: base_commit.to_string(),
+            working_tree_sha256: clean_working_tree_digest(),
         },
         workspace_present,
     })
@@ -106,7 +119,7 @@ pub fn resolve(host: &mut impl Host, config: &MainConfig, context: ResolveContex
         comparison,
         git_root,
         current_metadata,
-        baseline_path,
+        baseline,
         current_path,
         excluded_paths,
     } = context;
@@ -119,16 +132,19 @@ pub fn resolve(host: &mut impl Host, config: &MainConfig, context: ResolveContex
         None => cached_or_create_current(host, config, current_metadata, git_root, &cache_dir, current_key)?,
     };
 
-    let baseline_key = baseline_cache_key(current_metadata, git_root, config_path, &comparison.merge_base, true)?;
-    let baseline = match baseline_path {
-        Some(path) => load_explicit(host, path, &baseline_key, "baseline")?,
+    let baseline_key = baseline_cache_key(current_metadata, git_root, config_path, &comparison.base_commit, true)?;
+    let baseline = match baseline {
+        Some(explicit) => {
+            warn_if_stale(host, explicit.path, &explicit.tree, &baseline_key, "baseline");
+            explicit.tree
+        }
         None => cached_or_create_baseline(
             host,
             config,
             current_metadata,
             git_root,
             &cache_dir,
-            &comparison.merge_base,
+            &comparison.base_commit,
             baseline_key,
         )?,
     };
@@ -165,7 +181,7 @@ fn cached_or_create_baseline(
     current_metadata: &CargoMetadata,
     git_root: &Path,
     cache_dir: &Path,
-    merge_base: &str,
+    base_commit: &str,
     expected_key: SnapshotCacheKey,
 ) -> Result<WorkspaceTree> {
     let cache_path = cache_dir.join("baseline.json");
@@ -175,7 +191,7 @@ fn cached_or_create_baseline(
     }
 
     let workspace = workspace_relative_path(current_metadata, git_root)?;
-    let mut worktree = TemporaryWorktree::create(host, git_root, merge_base)?;
+    let mut worktree = TemporaryWorktree::create(host, git_root, base_commit)?;
     let workspace_dir = worktree.path.join(&workspace);
     let snapshot_result = if workspace_dir.join("Cargo.toml").is_file() {
         let metadata = crate::cargo::metadata(host, Some(&workspace_dir))
@@ -637,7 +653,7 @@ mod tests {
         let baseline = root.join("target/cargo-delta/baseline.json");
         fs::remove_file(root.join("target/cargo-delta/current.json")).unwrap();
         let config = root.join("delta.toml");
-        fs::write(&config, "[git]\nremote_branch = \"baseline\"\n").unwrap();
+        fs::write(&config, "[git]\nremote_branch = \"HEAD\"\n").unwrap();
         let mut host = ProcessHost::new(root.clone());
         crate::run(
             &mut host,
@@ -688,7 +704,7 @@ mod tests {
         fs::write(&current, serde_json::to_vec_pretty(&current_json).unwrap()).unwrap();
 
         let config = root.join("delta.toml");
-        fs::write(&config, "[git]\nremote_branch = \"baseline\"\n").unwrap();
+        fs::write(&config, "[git]\nremote_branch = \"HEAD\"\n").unwrap();
         let mut host = ProcessHost::new(root.clone());
         crate::run(
             &mut host,
@@ -738,6 +754,38 @@ mod tests {
         assert!(impact_host.stderr().contains("Using cached baseline snapshot"));
         assert!(impact_host.stderr().contains("Using cached current snapshot"));
         assert_eq!(impact_host.worktree_adds(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn explicit_baseline_with_working_tree_changes_is_rejected() {
+        let root = repository("dirty-explicit-baseline");
+        write_workspace(&root, 1);
+        commit(&root, "baseline");
+        write_workspace(&root, 2);
+        let baseline = root.join("target/dirty-baseline.json");
+        let snapshot_host = snapshot(&root, Some(&baseline));
+        assert_eq!(snapshot_host.exit_code, None, "{}", snapshot_host.stderr());
+
+        let output = root.join("target/impact.packages");
+        let mut impact_host = ProcessHost::new(root.clone());
+        crate::run(
+            &mut impact_host,
+            [
+                "cargo".to_string(),
+                "delta".to_string(),
+                "impact".to_string(),
+                "--baseline".to_string(),
+                baseline.display().to_string(),
+                "--output".to_string(),
+                output.display().to_string(),
+            ],
+        );
+
+        assert_eq!(impact_host.exit_code, Some(1));
+        assert!(impact_host.stderr().contains("contains working-tree changes"));
+        assert!(!output.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

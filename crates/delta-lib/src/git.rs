@@ -17,7 +17,7 @@ pub struct GitDiff {
 
 #[derive(Debug, Clone)]
 pub struct GitComparison {
-    pub merge_base: String,
+    pub base_commit: String,
     pub diff: GitDiff,
 }
 
@@ -70,14 +70,24 @@ pub fn compare(
         .trim()
         .to_string();
 
+    compare_from_commit(host, workspace_path, &merge_base, include_worktree, excluded_paths)
+}
+
+pub fn compare_from_commit(
+    host: &mut impl Host,
+    workspace_path: &Path,
+    base_commit: &str,
+    include_worktree: bool,
+    excluded_paths: &[PathBuf],
+) -> Result<GitComparison> {
     if include_worktree {
         return Ok(GitComparison {
-            diff: working_tree_diff(host, workspace_path, &merge_base, excluded_paths)?,
-            merge_base,
+            diff: working_tree_diff(host, workspace_path, base_commit, excluded_paths)?,
+            base_commit: base_commit.to_string(),
         });
     }
 
-    let diff_arg = format!("{merge_base}..HEAD");
+    let diff_arg = format!("{base_commit}..HEAD");
     let diff_output = host
         .run_command("git", &["diff", "--name-only", &diff_arg], Some(workspace_path))
         .map_err(|e| Error::Git(format!("Failed to run git diff: {e}")))?;
@@ -112,16 +122,16 @@ pub fn compare(
         .collect();
 
     Ok(GitComparison {
-        merge_base,
+        base_commit: base_commit.to_string(),
         diff: GitDiff { changed, deleted },
     })
 }
 
-fn working_tree_diff(host: &mut impl Host, workspace_path: &Path, merge_base: &str, excluded_paths: &[PathBuf]) -> Result<GitDiff> {
+fn working_tree_diff(host: &mut impl Host, workspace_path: &Path, base_commit: &str, excluded_paths: &[PathBuf]) -> Result<GitDiff> {
     let diff_output = host
         .run_command(
             "git",
-            &["diff", "--name-status", "--no-renames", "-z", merge_base, "--"],
+            &["diff", "--name-status", "--no-renames", "-z", base_commit, "--"],
             Some(workspace_path),
         )
         .map_err(|error| Error::Git(format!("Failed to run working-tree git diff: {error}")))?;
@@ -475,7 +485,7 @@ mod tests {
 
         let comparison = compare(&mut host, Path::new("/repo"), None, Some("origin/main"), true, &[]).unwrap();
 
-        assert_eq!(comparison.merge_base, "merge-base");
+        assert_eq!(comparison.base_commit, "merge-base");
         assert_eq!(comparison.diff.changed, [PathBuf::from("src/lib.rs"), PathBuf::from("src/new.rs")]);
         assert_eq!(comparison.diff.deleted, [PathBuf::from("src/old.rs")]);
     }
