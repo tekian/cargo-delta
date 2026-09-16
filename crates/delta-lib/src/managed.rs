@@ -524,10 +524,12 @@ mod tests {
         fs::remove_file(root.join("rust-toolchain.toml")).unwrap();
         commit(&root, "remove baseline toolchain");
         write_workspace(&workspace, 2);
+        let caller_workspace = workspace.join("path-alias").join("..");
+        fs::create_dir_all(workspace.join("path-alias")).unwrap();
         let output = PathBuf::from("impact.packages");
         let output_file = workspace.join(&output);
 
-        let first = invoke(&workspace, &output);
+        let first = invoke(&caller_workspace, &output);
         assert_eq!(first.exit_code, None, "{}", first.stderr());
         assert_eq!(fs::read_to_string(&output_file).unwrap(), "managed-lib@1.2.3\n");
         assert_eq!(first.worktree_adds(), 1);
@@ -551,7 +553,7 @@ mod tests {
         let stale_current = workspace.join("target/stale-current.json");
         let _copied = fs::copy(workspace.join("target/cargo-delta/current.json"), &stale_current).unwrap();
 
-        let second = invoke(&workspace, &output);
+        let second = invoke(&caller_workspace, &output);
         assert_eq!(second.exit_code, None, "{}", second.stderr());
         assert!(second.stderr().contains("Using cached baseline snapshot"));
         assert!(second.stderr().contains("Using cached current snapshot"));
@@ -559,24 +561,24 @@ mod tests {
         assert_eq!(second.worktree_adds(), 0);
 
         write_workspace(&workspace, 3);
-        let stale = invoke_with_current(&workspace, &output, Some(&stale_current));
+        let stale = invoke_with_current(&caller_workspace, &output, Some(&stale_current));
         assert_eq!(stale.exit_code, None, "{}", stale.stderr());
         assert!(stale.stderr().contains("supplied current snapshot"));
         assert!(stale.stderr().contains("not up to date"));
 
-        let third = invoke(&workspace, &output);
+        let third = invoke(&caller_workspace, &output);
         assert_eq!(third.exit_code, None, "{}", third.stderr());
         assert!(third.stderr().contains("Using cached baseline snapshot"));
         assert!(!third.stderr().contains("Using cached current snapshot"));
         assert_eq!(third.worktree_adds(), 0);
 
         fs::write(workspace.join("untracked.txt"), "one").unwrap();
-        let untracked = invoke(&workspace, &output);
+        let untracked = invoke(&caller_workspace, &output);
         assert_eq!(untracked.exit_code, None, "{}", untracked.stderr());
         assert!(!untracked.stderr().contains("Using cached current snapshot"));
 
         fs::write(workspace.join("untracked.txt"), "two").unwrap();
-        let changed_untracked = invoke(&workspace, &output);
+        let changed_untracked = invoke(&caller_workspace, &output);
         assert_eq!(changed_untracked.exit_code, None, "{}", changed_untracked.stderr());
         assert!(!changed_untracked.stderr().contains("Using cached current snapshot"));
 

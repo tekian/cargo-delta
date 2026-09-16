@@ -241,12 +241,13 @@ pub fn working_tree_digest(host: &mut impl Host, git_root: &Path, excluded_paths
 }
 
 fn excluded_pathspecs(git_root: &Path, paths: &[PathBuf]) -> Vec<String> {
+    let resolved_root = resolve_path(git_root);
     paths
         .iter()
         .filter_map(|path| {
             let absolute = if path.is_absolute() { path.clone() } else { git_root.join(path) };
-            absolute
-                .strip_prefix(git_root)
+            resolve_path(&absolute)
+                .strip_prefix(&resolved_root)
                 .ok()
                 .filter(|relative| !relative.as_os_str().is_empty())
                 .map(|relative| format!(":(exclude){}", relative.to_string_lossy().replace('\\', "/")))
@@ -255,15 +256,37 @@ fn excluded_pathspecs(git_root: &Path, paths: &[PathBuf]) -> Vec<String> {
 }
 
 fn is_excluded(git_root: &Path, relative: &Path, excluded_paths: &[PathBuf]) -> bool {
-    let candidate = git_root.join(relative);
+    let candidate = resolve_path(&git_root.join(relative));
     excluded_paths.iter().any(|excluded| {
         let excluded = if excluded.is_absolute() {
             excluded.clone()
         } else {
             git_root.join(excluded)
         };
+        let excluded = resolve_path(&excluded);
         candidate == excluded || candidate.starts_with(excluded)
     })
+}
+
+fn resolve_path(path: &Path) -> PathBuf {
+    let mut unresolved = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(mut resolved) = fs::canonicalize(existing) {
+            for component in unresolved.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+        let Some(component) = existing.file_name() else {
+            return path.to_path_buf();
+        };
+        unresolved.push(component.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return path.to_path_buf();
+        };
+        existing = parent;
+    }
 }
 
 fn git_stdout(host: &mut impl Host, git_root: &Path, args: &[&str], operation: &str) -> Result<String> {
@@ -477,6 +500,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(comparison.diff.changed, [PathBuf::from("src/lib.rs"), PathBuf::from("src/new.rs")]);
+    }
+
+    #[test]
+    fn exclusions_resolve_equivalent_paths_with_missing_leaf() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-exclusion-path-{}", std::process::id()));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let spelled_root = nested.join("..");
+        let output = root.join("output.txt");
+
+        assert_eq!(
+            excluded_pathspecs(&spelled_root, core::slice::from_ref(&output)),
+            [":(exclude)output.txt"]
+        );
+        assert!(is_excluded(&spelled_root, Path::new("output.txt"), &[output]));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
