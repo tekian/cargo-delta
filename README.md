@@ -337,8 +337,9 @@ directories and exclude the output file from the digest.
 
 ### Impact
 
-`cargo delta impact` compares two snapshots plus the git diff and prints which
-packages are impacted, in a shape your CI/CD can consume.
+`cargo delta impact` combines the Git change set with the baseline and current
+snapshots. The snapshots map changed, deleted, and newly discovered inputs to
+packages and provide the dependency graph used to calculate impact.
 
 - **Modified**: Packages directly modified by Git changes.
 - **Affected**: Modified packages plus all their dependents, direct and indirect.
