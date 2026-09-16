@@ -260,17 +260,21 @@ fn config_digest(config_path: Option<&PathBuf>) -> Result<String> {
 }
 
 fn workspace_relative_path(metadata: &CargoMetadata, git_root: &Path) -> Result<PathBuf> {
-    metadata
-        .workspace_root
-        .strip_prefix(git_root)
-        .map(Path::to_path_buf)
-        .map_err(|_error| {
-            Error::Other(format!(
-                "Cargo workspace '{}' is outside Git root '{}'",
-                metadata.workspace_root.display(),
-                git_root.display()
-            ))
-        })
+    let workspace_root = fs::canonicalize(&metadata.workspace_root).map_err(|error| {
+        Error::Other(format!(
+            "Failed to resolve Cargo workspace '{}': {error}",
+            metadata.workspace_root.display()
+        ))
+    })?;
+    let git_root = fs::canonicalize(git_root)
+        .map_err(|error| Error::Other(format!("Failed to resolve Git root '{}': {error}", git_root.display())))?;
+    workspace_root.strip_prefix(&git_root).map(Path::to_path_buf).map_err(|_error| {
+        Error::Other(format!(
+            "Cargo workspace '{}' is outside Git root '{}'",
+            metadata.workspace_root.display(),
+            git_root.display()
+        ))
+    })
 }
 
 struct TemporaryWorktree {
@@ -487,6 +491,21 @@ mod tests {
         }
         crate::run(&mut host, args);
         host
+    }
+
+    #[test]
+    fn workspace_path_uses_resolved_filesystem_identity() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-resolved-workspace-{}", std::process::id()));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let metadata = CargoMetadata {
+            packages: Vec::new(),
+            workspace_root: nested.join(".."),
+            target_directory: root.join("target"),
+        };
+
+        assert_eq!(workspace_relative_path(&metadata, &root).unwrap(), PathBuf::new());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
