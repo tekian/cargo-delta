@@ -386,8 +386,8 @@ cargo delta impact --baseline main.json --current feature.json
 ```
 
 The baseline must describe a clean checkout because its digest cannot reconstruct
-uncommitted baseline content. Legacy snapshots without a `cache_key` continue to
-use `[git].remote_branch` or primary-branch discovery for compatibility.
+uncommitted baseline content. Explicit baseline and current snapshots must both
+contain a `cache_key`; older keyless artifacts are rejected as invalid.
 
 `-f`/`--format` controls the emitted representation:
 

@@ -370,14 +370,12 @@ fn build_snapshot(
     }
 }
 
-fn explicit_baseline_head<'a>(path: &Path, tree: &'a WorkspaceTree) -> error::Result<Option<&'a str>> {
-    tree.cache_key.as_ref().map_or(Ok(None), |key| {
-        key.clean_head().map(Some).ok_or_else(|| {
-            error::Error::Other(format!(
-                "Explicit baseline snapshot '{}' contains working-tree changes and cannot define a Git diff base",
-                path.display()
-            ))
-        })
+fn explicit_baseline_head<'a>(path: &Path, tree: &'a WorkspaceTree) -> error::Result<&'a str> {
+    managed::cache_key(path, tree, "baseline")?.clean_head().ok_or_else(|| {
+        error::Error::Other(format!(
+            "Explicit baseline snapshot '{}' contains working-tree changes and cannot define a Git diff base",
+            path.display()
+        ))
     })
 }
 
@@ -395,28 +393,25 @@ fn resolve_impact_inputs(
     if let (Some(baseline_path), Some(current_path)) = (command.baseline.as_deref(), command.current.as_deref()) {
         let baseline: WorkspaceTree = utils::deser_json(baseline_path)?;
         let current: WorkspaceTree = utils::deser_json(current_path)?;
+        let _ = managed::cache_key(current_path, &current, "current")?;
         let excluded_paths = [command.baseline.clone(), command.current.clone(), command.output.clone()]
             .into_iter()
             .flatten()
             .map(|path| if path.is_absolute() { path } else { caller_dir.join(path) })
             .collect::<Vec<_>>();
-        let comparison = match explicit_baseline_head(baseline_path, &baseline)? {
-            Some(base_commit) => git::compare_from_commit(host, &git_root, base_commit, true, &excluded_paths)?,
-            None => git::compare(host, &git_root, config.git.as_ref(), None, false, &[])?,
-        };
+        let base_commit = explicit_baseline_head(baseline_path, &baseline)?;
+        let comparison = git::compare_from_commit(host, &git_root, base_commit, true, &excluded_paths)?;
         if comparison.diff.changed.is_empty() && comparison.diff.deleted.is_empty() {
             return Ok(None);
         }
-        if baseline.cache_key.is_some() || current.cache_key.is_some() {
-            let metadata = cargo::metadata(host, Some(&caller_dir))
-                .map_err(|error| error::Error::Other(format!("Failed to read current Cargo metadata: {error}")))?;
-            let mut excluded_paths = excluded_paths;
-            excluded_paths.push(metadata.target_directory.join("cargo-delta"));
-            let current_key = managed::current_cache_key(host, &metadata, &git_root, config_path, true, &excluded_paths)?;
-            let baseline_key = managed::baseline_cache_key(&metadata, &git_root, config_path, &comparison.base_commit, true)?;
-            managed::warn_if_stale(host, baseline_path, &baseline, &baseline_key, "baseline");
-            managed::warn_if_stale(host, current_path, &current, &current_key, "current");
-        }
+        let metadata = cargo::metadata(host, Some(&caller_dir))
+            .map_err(|error| error::Error::Other(format!("Failed to read current Cargo metadata: {error}")))?;
+        let mut excluded_paths = excluded_paths;
+        excluded_paths.push(metadata.target_directory.join("cargo-delta"));
+        let current_key = managed::current_cache_key(host, &metadata, &git_root, config_path, true, &excluded_paths)?;
+        let baseline_key = managed::baseline_cache_key(&metadata, &git_root, config_path, &comparison.base_commit, true)?;
+        managed::warn_if_stale(host, baseline_path, &baseline, &baseline_key, "baseline")?;
+        managed::warn_if_stale(host, current_path, &current, &current_key, "current")?;
         return Ok(Some(managed::ManagedImpact {
             baseline,
             current,
@@ -441,10 +436,10 @@ fn resolve_impact_inputs(
         None => None,
     };
     let comparison = match baseline.as_ref() {
-        Some(explicit) => match explicit_baseline_head(explicit.path, &explicit.tree)? {
-            Some(base_commit) => git::compare_from_commit(host, &git_root, base_commit, true, &excluded_paths)?,
-            None => git::compare(host, &git_root, config.git.as_ref(), None, true, &excluded_paths)?,
-        },
+        Some(explicit) => {
+            let base_commit = explicit_baseline_head(explicit.path, &explicit.tree)?;
+            git::compare_from_commit(host, &git_root, base_commit, true, &excluded_paths)?
+        }
         None => git::compare(
             host,
             &git_root,
@@ -902,6 +897,12 @@ mod tests {
             files,
             packages,
         }
+    }
+
+    fn make_keyed_workspace(package_defs: &[(&str, &[&str], &[&str])], head: &str) -> WorkspaceTree {
+        let mut tree = make_workspace(package_defs);
+        tree.cache_key = Some(managed::SnapshotCacheKey::clean_test_key(head));
+        tree
     }
 
     // --- get_impacted_packages tests ---
@@ -1530,16 +1531,15 @@ mod tests {
     fn run_subcommand_no_changes_exits_zero() {
         let tmp = std::env::temp_dir().join(format!("cargo-delta-test-run-no-changes-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
-        let snapshot = serde_json::to_string_pretty(&make_workspace(&[])).unwrap();
+        let snapshot = serde_json::to_string_pretty(&make_keyed_workspace(&[], "abc123")).unwrap();
         let baseline = tmp.join("baseline.json");
         let current = tmp.join("current.json");
         fs::write(&baseline, &snapshot).unwrap();
         fs::write(&current, snapshot).unwrap();
         let mut host = TestHost::new().with_commands(vec![
             Ok(success_output(&format!("{}\n", tmp.display()))), // git rev-parse
-            Ok(success_output("abc\trefs/heads/master\n")),      // git ls-remote (master found)
-            Ok(success_output("abc123\n")),                      // git merge-base
             Ok(success_output("")),                              // git diff (no changes)
+            Ok(success_output("")),                              // untracked files
         ]);
 
         // Uses the legacy "run" alias to guard against accidental alias removal.
@@ -1566,15 +1566,14 @@ mod tests {
     fn impact_subcommand_canonical_name_works() {
         let tmp = std::env::temp_dir().join(format!("cargo-delta-test-impact-name-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
-        let snapshot = serde_json::to_string_pretty(&make_workspace(&[])).unwrap();
+        let snapshot = serde_json::to_string_pretty(&make_keyed_workspace(&[], "abc123")).unwrap();
         let baseline = tmp.join("baseline.json");
         let current = tmp.join("current.json");
         fs::write(&baseline, &snapshot).unwrap();
         fs::write(&current, snapshot).unwrap();
         let mut host = TestHost::new().with_commands(vec![
             Ok(success_output(&format!("{}\n", tmp.display()))),
-            Ok(success_output("abc\trefs/heads/master\n")),
-            Ok(success_output("abc123\n")),
+            Ok(success_output("")),
             Ok(success_output("")),
         ]);
 
@@ -1602,19 +1601,29 @@ mod tests {
         let tmp = std::env::temp_dir().join("cargo_delta_test_run_changes");
         let _ = fs::create_dir_all(&tmp);
 
-        let tree = make_workspace(&[("app", &["app/src/main.rs"], &["lib"]), ("lib", &["lib/src/lib.rs"], &[])]);
+        let tree = make_keyed_workspace(
+            &[("app", &["app/src/main.rs"], &["lib"]), ("lib", &["lib/src/lib.rs"], &[])],
+            "abc123",
+        );
         let json = serde_json::to_string_pretty(&tree).unwrap();
         let baseline_path = tmp.join("baseline.json");
         let current_path = tmp.join("current.json");
         fs::write(&baseline_path, &json).unwrap();
         fs::write(&current_path, &json).unwrap();
 
-        let git_root = tmp.to_string_lossy().to_string();
+        let metadata = CargoMetadata {
+            packages: Vec::new(),
+            workspace_root: tmp.clone(),
+            target_directory: tmp.join("target"),
+        };
         let mut host = TestHost::new().with_commands(vec![
-            Ok(success_output(&format!("{git_root}\n"))),   // git rev-parse
-            Ok(success_output("abc\trefs/heads/master\n")), // git ls-remote
-            Ok(success_output("abc123\n")),                 // git merge-base
-            Ok(success_output("lib/src/lib.rs\n")),         // git diff (one file)
+            Ok(success_output(&format!("{}\n", tmp.display()))), // git rev-parse
+            Ok(success_output("D\0lib/src/lib.rs\0")),           // git diff
+            Ok(success_output("")),                              // untracked files
+            Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
+            Ok(success_output("head\n")),
+            Ok(success_output("")),
+            Ok(success_output("")),
         ]);
 
         run(
@@ -1647,17 +1656,25 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cargo-delta-impact-write-failure-{}", std::process::id()));
         fs::create_dir_all(root.join("lib/src")).unwrap();
         fs::write(root.join("lib/src/lib.rs"), "pub fn value() {}\n").unwrap();
-        let tree = make_workspace(&[("lib", &["lib/src/lib.rs"], &[])]);
+        let tree = make_keyed_workspace(&[("lib", &["lib/src/lib.rs"], &[])], "abc123");
         let snapshot = serde_json::to_string_pretty(&tree).unwrap();
         let baseline = root.join("baseline.json");
         let current = root.join("current.json");
         fs::write(&baseline, &snapshot).unwrap();
         fs::write(&current, &snapshot).unwrap();
+        let metadata = CargoMetadata {
+            packages: Vec::new(),
+            workspace_root: root.clone(),
+            target_directory: root.join("target"),
+        };
         let mut host = TestHost::new().with_commands(vec![
             Ok(success_output(&format!("{}\n", root.display()))),
-            Ok(success_output("abc\trefs/heads/master\n")),
-            Ok(success_output("abc123\n")),
-            Ok(success_output("lib/src/lib.rs\n")),
+            Ok(success_output("M\0lib/src/lib.rs\0")),
+            Ok(success_output("")),
+            Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
+            Ok(success_output("head\n")),
+            Ok(success_output("")),
+            Ok(success_output("")),
         ]);
 
         run(

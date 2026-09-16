@@ -74,10 +74,10 @@ Managed comparison resolves `merge-base(HEAD, REF)` and compares that commit
 with the current working tree. It includes committed, staged, unstaged,
 deleted, and non-ignored untracked paths.
 
-A cache-keyed explicit baseline defines the exact base commit from its embedded
-`HEAD`; configured-branch discovery is used only for legacy keyless snapshots.
-An explicit baseline with working-tree changes is rejected because its digest
-can validate state but cannot reconstruct those changes for a Git comparison.
+An explicit baseline defines the exact base commit from its embedded `HEAD`.
+Explicit snapshots without a cache key are invalid, and an explicit baseline
+with working-tree changes is rejected because its digest can validate state but
+cannot reconstruct those changes for a Git comparison.
 
 The baseline snapshot owns deleted-file lookups. The current snapshot owns
 changed and newly discovered files and supplies the dependency graph used for
@@ -87,7 +87,7 @@ affected and required traversal.
 
 Generated snapshots are cached as `target/cargo-delta/baseline.json` and
 `target/cargo-delta/current.json`. The ordinary snapshot JSON is extended with
-an optional `cache_key`, so there is no separate cache-entry artifact or
+a required `cache_key`, so there is no separate cache-entry artifact or
 generation path. `cargo delta snapshot` and managed impact generation use the
 same snapshot builder and produce directly interchangeable files.
 

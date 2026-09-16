@@ -42,6 +42,21 @@ impl SnapshotCacheKey {
     pub fn clean_head(&self) -> Option<&str> {
         (self.source.working_tree_sha256 == clean_working_tree_digest()).then_some(self.source.head.as_str())
     }
+
+    #[cfg(test)]
+    pub(crate) fn clean_test_key(head: &str) -> Self {
+        Self {
+            cache_version: CACHE_VERSION,
+            cargo_delta_version: env!("CARGO_PKG_VERSION").to_string(),
+            workspace: PathBuf::new(),
+            config_sha256: format!("{:x}", Sha256::digest(b"<defaults>")),
+            source: SnapshotSource {
+                head: head.to_string(),
+                working_tree_sha256: clean_working_tree_digest(),
+            },
+            workspace_present: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,7 +150,7 @@ pub fn resolve(host: &mut impl Host, config: &MainConfig, context: ResolveContex
     let baseline_key = baseline_cache_key(current_metadata, git_root, config_path, &comparison.base_commit, true)?;
     let baseline = match baseline {
         Some(explicit) => {
-            warn_if_stale(host, explicit.path, &explicit.tree, &baseline_key, "baseline");
+            warn_if_stale(host, explicit.path, &explicit.tree, &baseline_key, "baseline")?;
             explicit.tree
         }
         None => cached_or_create_baseline(
@@ -223,28 +238,28 @@ fn cached_or_create_baseline(
 
 fn load_explicit(host: &mut impl Host, path: &Path, expected: &SnapshotCacheKey, label: &str) -> Result<WorkspaceTree> {
     let snapshot: WorkspaceTree = crate::utils::deser_json(path)?;
-    warn_if_stale(host, path, &snapshot, expected, label);
+    warn_if_stale(host, path, &snapshot, expected, label)?;
     Ok(snapshot)
 }
 
-pub fn warn_if_stale(host: &mut impl Host, path: &Path, snapshot: &WorkspaceTree, expected: &SnapshotCacheKey, label: &str) {
-    match snapshot.cache_key.as_ref() {
-        Some(actual) if !actual.matches_identity(expected) => {
-            let _ = writeln!(
-                host.error(),
-                "Warning: supplied {label} snapshot '{}' is not up to date for the current comparison",
-                path.display()
-            );
-        }
-        None => {
-            let _ = writeln!(
-                host.error(),
-                "Warning: supplied {label} snapshot '{}' has no cache key; freshness cannot be verified",
-                path.display()
-            );
-        }
-        Some(_) => {}
+pub fn cache_key<'a>(path: &Path, snapshot: &'a WorkspaceTree, label: &str) -> Result<&'a SnapshotCacheKey> {
+    snapshot.cache_key.as_ref().ok_or_else(|| {
+        Error::Other(format!(
+            "Supplied {label} snapshot '{}' has no cache key and is not a valid snapshot",
+            path.display()
+        ))
+    })
+}
+
+pub fn warn_if_stale(host: &mut impl Host, path: &Path, snapshot: &WorkspaceTree, expected: &SnapshotCacheKey, label: &str) -> Result<()> {
+    if !cache_key(path, snapshot, label)?.matches_identity(expected) {
+        let _ = writeln!(
+            host.error(),
+            "Warning: supplied {label} snapshot '{}' is not up to date for the current comparison",
+            path.display()
+        );
     }
+    Ok(())
 }
 
 fn read_cache(path: &Path, expected: &SnapshotCacheKey) -> Option<WorkspaceTree> {
@@ -683,7 +698,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn explicit_snapshot_freshness_is_checked_when_only_one_has_a_cache_key() {
+    fn explicit_snapshots_without_cache_keys_are_rejected() {
         let root = repository("mixed-explicit-cache-keys");
         write_workspace(&root, 1);
         commit(&root, "baseline");
@@ -696,23 +711,18 @@ mod tests {
 
         let baseline = root.join("target/cargo-delta/baseline.json");
         let current = root.join("target/cargo-delta/current.json");
-        let mut baseline_json: serde_json::Value = serde_json::from_slice(&fs::read(&baseline).unwrap()).unwrap();
-        baseline_json["cache_key"]["workspace"] = "stale".into();
-        fs::write(&baseline, serde_json::to_vec_pretty(&baseline_json).unwrap()).unwrap();
+        let original_baseline = fs::read(&baseline).unwrap();
+        let original_current = fs::read(&current).unwrap();
         let mut current_json: serde_json::Value = serde_json::from_slice(&fs::read(&current).unwrap()).unwrap();
         current_json["cache_key"] = serde_json::Value::Null;
         fs::write(&current, serde_json::to_vec_pretty(&current_json).unwrap()).unwrap();
 
-        let config = root.join("delta.toml");
-        fs::write(&config, "[git]\nremote_branch = \"HEAD\"\n").unwrap();
         let mut host = ProcessHost::new(root.clone());
         crate::run(
             &mut host,
             [
                 "cargo".to_string(),
                 "delta".to_string(),
-                "-c".to_string(),
-                config.display().to_string(),
                 "impact".to_string(),
                 "--baseline".to_string(),
                 baseline.display().to_string(),
@@ -723,9 +733,33 @@ mod tests {
             ],
         );
 
-        assert_eq!(host.exit_code, None, "{}", host.stderr());
-        assert!(host.stderr().contains("supplied baseline snapshot"));
-        assert!(host.stderr().contains("not up to date"));
+        assert_eq!(host.exit_code, Some(1));
+        assert!(host.stderr().contains("current snapshot"));
+        assert!(host.stderr().contains("has no cache key"));
+
+        fs::write(&current, original_current).unwrap();
+        let mut baseline_json: serde_json::Value = serde_json::from_slice(&original_baseline).unwrap();
+        baseline_json["cache_key"] = serde_json::Value::Null;
+        fs::write(&baseline, serde_json::to_vec_pretty(&baseline_json).unwrap()).unwrap();
+        let mut host = ProcessHost::new(root.clone());
+        crate::run(
+            &mut host,
+            [
+                "cargo".to_string(),
+                "delta".to_string(),
+                "impact".to_string(),
+                "--baseline".to_string(),
+                baseline.display().to_string(),
+                "--current".to_string(),
+                current.display().to_string(),
+                "--output".to_string(),
+                output.display().to_string(),
+            ],
+        );
+
+        assert_eq!(host.exit_code, Some(1));
+        assert!(host.stderr().contains("baseline snapshot"));
+        assert!(host.stderr().contains("has no cache key"));
         fs::remove_dir_all(root).unwrap();
     }
 
