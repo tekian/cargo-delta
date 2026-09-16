@@ -46,7 +46,7 @@ directory name.
 ```
 
 Without `--output`, JSON is written to stdout. With `--output`, the same text
-is written directly to the requested file.
+is written directly to the requested file, creating missing parent directories.
 
 ## Impact model
 
@@ -78,19 +78,22 @@ affected and required traversal.
 
 Generated snapshots are cached as `target/cargo-delta/baseline.json` and
 `target/cargo-delta/current.json`. The ordinary snapshot JSON is extended with
-an optional `cache_key`, so the same file is both a public snapshot and a cache
-entry.
+an optional `cache_key`, so there is no separate cache-entry artifact or
+generation path. `cargo delta snapshot` and managed impact generation use the
+same snapshot builder and produce directly interchangeable files.
 
 Every key includes the cargo-delta/cache version, workspace path, and
-configuration digest. A baseline key identifies the immutable merge-base
-commit. A current key identifies `HEAD` plus a digest of tracked worktree
-changes and non-ignored untracked paths and contents. Explicit snapshots are
-used as requested, but cargo-delta warns when their embedded key does not match
-the state being compared or is absent.
+configuration digest. Every snapshot source is represented uniformly as `HEAD`
+plus a digest of tracked worktree changes and non-ignored untracked paths and
+contents. The managed baseline is the merge-base commit with the empty
+working-tree digest. Explicit snapshots are used as requested, but cargo-delta
+warns when their embedded key does not match the state being compared or is
+absent.
 
-The internal cache directory and exact explicit snapshot/output paths are
-excluded from the current-state digest so generated artifacts do not invalidate
-their own cache.
+The internal cache directory is always excluded from snapshot state, including
+when shell redirection hides the output path from cargo-delta. Exact explicit
+snapshot and output paths are also excluded from managed current-state
+calculation, so generated artifacts do not invalidate their own cache.
 
 A baseline cache miss creates a detached temporary worktree at the merge base
 and runs the existing snapshot builder at the corresponding workspace path.

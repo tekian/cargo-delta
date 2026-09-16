@@ -223,7 +223,16 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
     let _ = writeln!(host.error(), "Snapshotting workspace..");
     print_common_props(host, config_path);
 
-    let metadata = match cargo::metadata(host, None) {
+    let caller_dir = match host.current_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = writeln!(host.error(), "Error getting current directory: {error}");
+            host.exit(1);
+            return;
+        }
+    };
+
+    let metadata = match cargo::metadata(host, Some(&caller_dir)) {
         Ok(metadata) => metadata,
         Err(e) => {
             let _ = writeln!(host.error(), "Error getting cargo metadata: {e}");
@@ -234,7 +243,7 @@ fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&Path
 
     let workspace_root = &metadata.workspace_root;
 
-    let git_root = match git::get_top_level(host, None) {
+    let git_root = match git::get_top_level(host, Some(&caller_dir)) {
         Ok(root) => root,
         Err(e) => {
             let _ = writeln!(host.error(), "Error getting git root: {e}");
@@ -330,16 +339,16 @@ fn snapshot_cache_key(
     let caller_dir = host
         .current_dir()
         .map_err(|error| error::Error::Other(format!("Failed to get current directory: {error}")))?;
-    let excluded_paths = output
-        .map(|path| {
+    let mut excluded_paths = vec![metadata.target_directory.join("cargo-delta")];
+    if let Some(path) = output {
+        excluded_paths.push({
             if path.is_absolute() {
                 path.to_path_buf()
             } else {
                 caller_dir.join(path)
             }
-        })
-        .into_iter()
-        .collect::<Vec<_>>();
+        });
+    }
     managed::current_cache_key(host, metadata, git_root, config_path, true, &excluded_paths)
 }
 
@@ -629,7 +638,9 @@ fn write_output(host: &mut impl Host, output: Option<&Path>, text: &str) -> bool
                     }
                 }
             };
-            fs::write(path, text)
+            path.parent()
+                .map_or(Ok(()), fs::create_dir_all)
+                .and_then(|()| fs::write(path, text))
         }
         None => host.output().write_all(text.as_bytes()),
     };

@@ -37,10 +37,9 @@ impl SnapshotCacheKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum SnapshotSource {
-    Commit { commit: String },
-    WorkingTree { head: String, digest: String },
+struct SnapshotSource {
+    head: String,
+    working_tree_sha256: String,
 }
 
 pub struct ManagedImpact {
@@ -73,9 +72,9 @@ pub fn current_cache_key(
         cargo_delta_version: env!("CARGO_PKG_VERSION").to_string(),
         workspace: workspace_relative_path(metadata, git_root)?,
         config_sha256: config_digest(config_path)?,
-        source: SnapshotSource::WorkingTree {
+        source: SnapshotSource {
             head: crate::git::head_commit(host, git_root)?,
-            digest: crate::git::working_tree_digest(host, git_root, excluded_paths)?,
+            working_tree_sha256: crate::git::working_tree_digest(host, git_root, excluded_paths)?,
         },
         workspace_present,
     })
@@ -93,8 +92,9 @@ pub fn baseline_cache_key(
         cargo_delta_version: env!("CARGO_PKG_VERSION").to_string(),
         workspace: workspace_relative_path(metadata, git_root)?,
         config_sha256: config_digest(config_path)?,
-        source: SnapshotSource::Commit {
-            commit: merge_base.to_string(),
+        source: SnapshotSource {
+            head: merge_base.to_string(),
+            working_tree_sha256: format!("{:x}", Sha256::digest([0])),
         },
         workspace_present,
     })
@@ -479,6 +479,16 @@ mod tests {
         host
     }
 
+    fn snapshot(root: &Path, output: Option<&Path>) -> ProcessHost {
+        let mut host = ProcessHost::new(root.to_path_buf());
+        let mut args = vec!["cargo".to_string(), "delta".to_string(), "snapshot".to_string()];
+        if let Some(output) = output {
+            args.extend(["--output".to_string(), output.display().to_string()]);
+        }
+        crate::run(&mut host, args);
+        host
+    }
+
     #[test]
     #[cfg_attr(miri, ignore)]
     fn managed_impact_reuses_baseline_and_current_until_worktree_content_changes() {
@@ -504,7 +514,6 @@ mod tests {
         assert_eq!(first.worktree_adds(), 1);
         let cached_current: serde_json::Value =
             serde_json::from_slice(&fs::read(workspace.join("target/cargo-delta/current.json")).unwrap()).unwrap();
-        assert_eq!(cached_current["cache_key"]["source"]["kind"], "working_tree");
         assert_eq!(
             cached_current["cache_key"]["source"]["head"],
             git_output(&root, &["rev-parse", "HEAD"])
@@ -512,7 +521,14 @@ mod tests {
         assert_eq!(cached_current["cache_key"]["workspace"], "rust");
         let cached_baseline: serde_json::Value =
             serde_json::from_slice(&fs::read(workspace.join("target/cargo-delta/baseline.json")).unwrap()).unwrap();
-        assert_eq!(cached_baseline["cache_key"]["source"]["kind"], "commit");
+        assert_eq!(
+            cached_baseline["cache_key"]["source"]["head"],
+            git_output(&root, &["rev-parse", "baseline^{commit}"])
+        );
+        assert_eq!(
+            cached_baseline["cache_key"]["source"]["working_tree_sha256"],
+            format!("{:x}", Sha256::digest([0]))
+        );
         let stale_current = workspace.join("target/stale-current.json");
         let _copied = fs::copy(workspace.join("target/cargo-delta/current.json"), &stale_current).unwrap();
 
@@ -673,6 +689,59 @@ mod tests {
         assert_eq!(host.exit_code, None, "{}", host.stderr());
         assert!(host.stderr().contains("supplied baseline snapshot"));
         assert!(host.stderr().contains("not up to date"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn snapshots_generated_explicitly_are_reused_as_managed_cache_entries() {
+        let root = repository("explicit-cache-generation");
+        write_workspace(&root, 1);
+        commit(&root, "baseline");
+        git(&root, &["tag", "baseline"]);
+        let cache_dir = root.join("target/cargo-delta");
+        let baseline = cache_dir.join("baseline.json");
+
+        let baseline_host = snapshot(&root, Some(&baseline));
+        assert_eq!(baseline_host.exit_code, None, "{}", baseline_host.stderr());
+
+        write_workspace(&root, 2);
+        commit(&root, "current");
+        let current = cache_dir.join("current.json");
+        let current_host = snapshot(&root, Some(&current));
+        assert_eq!(current_host.exit_code, None, "{}", current_host.stderr());
+
+        let output = root.join("target/impact.packages");
+        let impact_host = invoke(&root, &output);
+        assert_eq!(impact_host.exit_code, None, "{}", impact_host.stderr());
+        assert!(impact_host.stderr().contains("Using cached baseline snapshot"));
+        assert!(impact_host.stderr().contains("Using cached current snapshot"));
+        assert_eq!(impact_host.worktree_adds(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn redirected_snapshot_is_reused_from_managed_current_cache_path() {
+        let root = repository("redirected-current-cache");
+        fs::write(root.join(".gitignore"), "").unwrap();
+        write_workspace(&root, 1);
+        commit(&root, "baseline");
+        git(&root, &["tag", "baseline"]);
+        write_workspace(&root, 2);
+        commit(&root, "current");
+
+        let current = root.join("target/cargo-delta/current.json");
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::write(&current, "").unwrap();
+        let snapshot_host = snapshot(&root, None);
+        assert_eq!(snapshot_host.exit_code, None, "{}", snapshot_host.stderr());
+        fs::write(&current, snapshot_host.stdout).unwrap();
+
+        let output = root.join("target/impact.packages");
+        let impact_host = invoke(&root, &output);
+        assert_eq!(impact_host.exit_code, None, "{}", impact_host.stderr());
+        assert!(impact_host.stderr().contains("Using cached current snapshot"));
         fs::remove_dir_all(root).unwrap();
     }
 }
