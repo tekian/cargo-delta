@@ -354,6 +354,26 @@ cargo delta impact --baseline main.json --current feature.json --affected -f pac
 cargo delta impact --baseline main.json --current feature.json --affected -f packages --output affected.packages
 ```
 
+When `--base-ref` is provided, `--baseline` may be omitted. Cargo-delta then
+generates and caches the merge-base snapshot automatically. `--current` is
+always optional and overrides the generated current-worktree snapshot when
+present:
+
+```bash
+cargo delta impact --base-ref origin/main --affected -f cargo-args-versioned
+cargo delta impact --baseline main.json --affected -f cargo-args-versioned
+```
+
+Managed snapshots are stored under Cargo's target directory in
+`cargo-delta/baseline.json` and `cargo-delta/current.json`. Their embedded
+`cache_key` records the source commit or working-tree content digest, workspace
+path, configuration digest, and cargo-delta version. A matching cache is
+reused; an explicit stale snapshot is accepted with a warning.
+
+The working-tree comparison includes committed, staged, unstaged, deleted, and
+non-ignored untracked files. If the merge base predates the Cargo workspace,
+all current packages are selected.
+
 
 ## Limitations
 

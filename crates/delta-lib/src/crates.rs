@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 pub type PackageId = String;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Packages {
     packages: HashMap<PackageId, Vec<PackageId>>,
 }
@@ -138,6 +138,11 @@ impl Packages {
 
     pub fn get_all_package_ids(&self) -> Vec<PackageId> {
         self.packages.keys().cloned().collect()
+    }
+
+    pub fn find_by_name(&self, package: &PackageId) -> Option<PackageId> {
+        let name = package_name(package);
+        self.packages.keys().find(|candidate| package_name(candidate) == name).cloned()
     }
 }
 

@@ -52,21 +52,55 @@ is written directly to the requested file.
 
 ```text
 cargo delta impact \
-  --baseline PATH \
-  --current PATH \
-  [--base-ref REF] \
+  (--baseline PATH | --base-ref REF) \
+  [--current PATH] \
   [--output PATH] \
   [-f FORMAT]
 ```
 
 Snapshots describe ownership and dependencies, not file contents. The Git diff
-provides the changed and deleted paths. `--base-ref REF` explicitly selects the
-ref used to compute `merge-base(HEAD, REF)..HEAD`; it overrides
-`[git].remote_branch` and automatic primary-branch discovery.
+provides the changed and deleted paths.
+
+An explicit `--baseline` is mutually exclusive with `--base-ref`. An explicit
+`--current` independently overrides current-snapshot generation. When either
+side is omitted, cargo-delta uses the cached snapshot when its embedded key is
+current and regenerates it otherwise.
+
+Managed comparison resolves `merge-base(HEAD, REF)` and compares that commit
+with the current working tree. It includes committed, staged, unstaged,
+deleted, and non-ignored untracked paths.
 
 The baseline snapshot owns deleted-file lookups. The current snapshot owns
 changed and newly discovered files and supplies the dependency graph used for
 affected and required traversal.
+
+## Snapshot cache
+
+Generated snapshots are cached as `target/cargo-delta/baseline.json` and
+`target/cargo-delta/current.json`. The ordinary snapshot JSON is extended with
+an optional `cache_key`, so the same file is both a public snapshot and a cache
+entry.
+
+Every key includes the cargo-delta/cache version, workspace path, and
+configuration digest. A baseline key identifies the immutable merge-base
+commit. A current key identifies `HEAD` plus a digest of tracked worktree
+changes and non-ignored untracked paths and contents. Explicit snapshots are
+used as requested, but cargo-delta warns when their embedded key does not match
+the state being compared or is absent.
+
+The internal cache directory and exact explicit snapshot/output paths are
+excluded from the current-state digest so generated artifacts do not invalidate
+their own cache.
+
+A baseline cache miss creates a detached temporary worktree at the merge base
+and runs the existing snapshot builder at the corresponding workspace path.
+The Cargo executable inherited through Cargo's `CARGO` environment variable is
+used, so a different or unavailable `rust-toolchain.toml` in the baseline does
+not change the selected toolchain. The temporary worktree is removed on both
+success and failure.
+
+If the workspace does not exist at the merge base, cargo-delta writes an empty
+baseline snapshot and widens every impact tier to all current packages.
 
 `-f packages` emits the selected union as sorted `name@version` package IDs,
 one per line. `cargo-args-versioned` and `cargo-excludes-versioned` place those

@@ -1,14 +1,18 @@
 use crate::host::Host;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 pub struct TestHost {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: Option<i32>,
+    pub command_calls: Vec<(OsString, Vec<String>, Option<PathBuf>)>,
     command_responses: VecDeque<io::Result<Output>>,
+    current_dir: PathBuf,
+    env_vars: HashMap<String, OsString>,
 }
 
 impl TestHost {
@@ -17,12 +21,20 @@ impl TestHost {
             stdout: Vec::new(),
             stderr: Vec::new(),
             exit_code: None,
+            command_calls: Vec::new(),
             command_responses: VecDeque::new(),
+            current_dir: std::env::current_dir().expect("tests require a current directory"),
+            env_vars: HashMap::new(),
         }
     }
 
     pub fn with_commands(mut self, responses: Vec<io::Result<Output>>) -> Self {
         self.command_responses = VecDeque::from(responses);
+        self
+    }
+
+    pub fn with_env_var(mut self, key: impl Into<String>, value: impl Into<OsString>) -> Self {
+        let _ = self.env_vars.insert(key.into(), value.into());
         self
     }
 
@@ -48,7 +60,20 @@ impl Host for TestHost {
         self.exit_code = Some(code);
     }
 
-    fn run_command(&mut self, _command: &str, _args: &[&str], _working_dir: Option<&Path>) -> io::Result<Output> {
+    fn current_dir(&self) -> io::Result<PathBuf> {
+        Ok(self.current_dir.clone())
+    }
+
+    fn env_var_os(&self, key: &str) -> Option<OsString> {
+        self.env_vars.get(key).cloned()
+    }
+
+    fn run_command(&mut self, command: impl AsRef<OsStr>, args: &[&str], working_dir: Option<&Path>) -> io::Result<Output> {
+        self.command_calls.push((
+            command.as_ref().to_os_string(),
+            args.iter().map(|arg| (*arg).to_string()).collect(),
+            working_dir.map(Path::to_path_buf),
+        ));
         self.command_responses
             .pop_front()
             .unwrap_or_else(|| Err(io::Error::other("no more mock command responses")))
