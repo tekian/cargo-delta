@@ -8,8 +8,9 @@ use std::{
 use syn::visit::Visit;
 
 use crate::{
-    cargo::{CargoCrate, CargoMetadata},
+    cargo::{CargoMetadata, CargoPackage},
     config::{MainConfig, ParserConfig},
+    crates::{PackageId, package_id},
     error::Result,
     host::Host,
     utils,
@@ -18,7 +19,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileKind {
     Workspace,     // Top-level Cargo.toml with [workspace]
-    Crate,         // Crate-level Cargo.toml
+    Package,       // Package-level Cargo.toml
     Target,        // Target entry point (bin, lib, etc.)
     Module,        // File resolved by mod declaration
     ModulePath,    // File resolved by #[path = "..."]
@@ -32,7 +33,7 @@ impl fmt::Display for FileKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Workspace => write!(f, "Workspace"),
-            Self::Crate => write!(f, "Crate"),
+            Self::Package => write!(f, "Package"),
             Self::Target => write!(f, "Target"),
             Self::Module => write!(f, "Module"),
             Self::ModulePath => write!(f, "ModulePath"),
@@ -49,6 +50,8 @@ impl fmt::Display for FileKind {
 pub struct FileNode {
     pub path: PathBuf,
     pub kind: FileKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<PackageId>,
     pub children: Vec<FileNode>,
 }
 
@@ -57,6 +60,16 @@ impl FileNode {
         Self {
             path,
             kind,
+            package: None,
+            children: Vec::new(),
+        }
+    }
+
+    pub const fn for_package(path: PathBuf, package: PackageId) -> Self {
+        Self {
+            path,
+            kind: FileKind::Package,
+            package: Some(package),
             children: Vec::new(),
         }
     }
@@ -93,25 +106,23 @@ impl FileNode {
         paths
     }
 
-    pub fn find_crates_containing_file(&self, target_file: &PathBuf) -> Vec<String> {
-        fn visit(node: &FileNode, target_file: &PathBuf, current_crate: Option<&str>, results: &mut Vec<String>) {
-            let current_crate = if matches!(node.kind, FileKind::Crate) {
-                node.path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+    pub fn find_packages_containing_file(&self, target_file: &PathBuf) -> Vec<PackageId> {
+        fn visit(node: &FileNode, target_file: &PathBuf, current_package: Option<&PackageId>, results: &mut Vec<PackageId>) {
+            let current_package = if matches!(node.kind, FileKind::Package) {
+                node.package.as_ref()
             } else {
-                current_crate
+                current_package
             };
 
             if &node.path == target_file
-                && let Some(crate_name) = current_crate
+                && let Some(package) = current_package
+                && !results.contains(package)
             {
-                let crate_string = crate_name.to_string();
-                if !results.contains(&crate_string) {
-                    results.push(crate_string);
-                }
+                results.push(package.clone());
             }
 
             for child in &node.children {
-                visit(child, target_file, current_crate, results);
+                visit(child, target_file, current_package, results);
             }
         }
 
@@ -437,7 +448,7 @@ fn find_assume_files(crate_root: &Path, patterns: &HashSet<String>) -> Vec<PathB
     found_files
 }
 
-pub fn build_tree(host: &mut impl Host, metadata: &CargoMetadata, crates: &[&CargoCrate], config: &MainConfig) -> FileNode {
+pub fn build_tree(host: &mut impl Host, metadata: &CargoMetadata, packages: &[&CargoPackage], config: &MainConfig) -> FileNode {
     let mut visited = HashSet::new();
 
     let root_path = metadata.workspace_root.join("Cargo.toml");
@@ -445,10 +456,10 @@ pub fn build_tree(host: &mut impl Host, metadata: &CargoMetadata, crates: &[&Car
 
     let mut root_node = FileNode::new(root_path, root_kind);
 
-    for crate_ in crates {
-        let mut node = FileNode::new(crate_.manifest_path.clone(), FileKind::Crate);
+    for package in packages {
+        let mut node = FileNode::for_package(package.manifest_path.clone(), package_id(&package.name, &package.version));
 
-        for target in &crate_.targets {
+        for target in &package.targets {
             let mut target_node = FileNode::new(target.src_path.clone(), FileKind::Target);
 
             let source_tree = build_file_node(
@@ -457,7 +468,7 @@ pub fn build_tree(host: &mut impl Host, metadata: &CargoMetadata, crates: &[&Car
                 &mut visited,
                 Some(&metadata.workspace_root),
                 config,
-                &crate_.name,
+                &package.name,
             );
 
             for child in source_tree.children {
@@ -467,10 +478,10 @@ pub fn build_tree(host: &mut impl Host, metadata: &CargoMetadata, crates: &[&Car
             node.add_child(target_node);
         }
 
-        let parser_config = config.crate_config(&crate_.name);
+        let parser_config = config.crate_config(&package.name);
         if parser_config.assume
             && !parser_config.assume_patterns.is_empty()
-            && let Some(crate_root) = crate_.manifest_path.parent()
+            && let Some(crate_root) = package.manifest_path.parent()
         {
             let assume_files = find_assume_files(crate_root, &parser_config.assume_patterns);
 
@@ -490,6 +501,7 @@ pub fn build_tree(host: &mut impl Host, metadata: &CargoMetadata, crates: &[&Car
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::TestHost;
 
     #[test]
     fn new_file_node_has_no_children() {
@@ -520,7 +532,7 @@ mod tests {
     #[test]
     fn len_counts_self_and_all_descendants() {
         let mut root = FileNode::new(PathBuf::from("root"), FileKind::Workspace);
-        let mut child = FileNode::new(PathBuf::from("child"), FileKind::Crate);
+        let mut child = FileNode::new(PathBuf::from("child"), FileKind::Package);
         child.add_child(FileNode::new(PathBuf::from("grandchild"), FileKind::Module));
         root.add_child(child);
         // Each node contributes (children_sum + 1), where each child contributes (child.len() + 1)
@@ -537,7 +549,7 @@ mod tests {
     #[test]
     fn distinct_collects_unique_paths() {
         let mut root = FileNode::new(PathBuf::from("root"), FileKind::Workspace);
-        let mut child = FileNode::new(PathBuf::from("a.rs"), FileKind::Crate);
+        let mut child = FileNode::new(PathBuf::from("a.rs"), FileKind::Package);
         child.add_child(FileNode::new(PathBuf::from("b.rs"), FileKind::Module));
         root.add_child(child);
         root.add_child(FileNode::new(PathBuf::from("c.rs"), FileKind::Module));
@@ -571,23 +583,60 @@ mod tests {
     }
 
     #[test]
-    fn find_crates_containing_file_finds_match() {
+    fn find_packages_containing_file_finds_match() {
         let mut root = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
-        let mut crate_node = FileNode::new(PathBuf::from("my-crate/Cargo.toml"), FileKind::Crate);
-        crate_node.add_child(FileNode::new(PathBuf::from("my-crate/src/lib.rs"), FileKind::Target));
-        root.add_child(crate_node);
+        let package = package_id("package-name", "0.1.0");
+        let mut package_node = FileNode::for_package(PathBuf::from("folder/Cargo.toml"), package.clone());
+        package_node.add_child(FileNode::new(PathBuf::from("folder/src/lib.rs"), FileKind::Target));
+        root.add_child(package_node);
 
-        let target = PathBuf::from("my-crate/src/lib.rs");
-        let crates = root.find_crates_containing_file(&target);
-        assert_eq!(crates, vec!["my-crate"]);
+        let target = PathBuf::from("folder/src/lib.rs");
+        let packages = root.find_packages_containing_file(&target);
+        assert_eq!(packages, vec![package]);
     }
 
     #[test]
-    fn find_crates_containing_file_returns_empty_for_no_match() {
+    fn find_packages_containing_file_returns_empty_for_no_match() {
         let root = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
         let target = PathBuf::from("nonexistent.rs");
-        let crates = root.find_crates_containing_file(&target);
-        assert!(crates.is_empty());
+        let packages = root.find_packages_containing_file(&target);
+        assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn build_tree_adds_files_matching_nonempty_assume_patterns() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-assume-patterns-{}", std::process::id()));
+        let package_root = root.join("package");
+        fs::create_dir_all(&package_root).unwrap();
+        let assumed_file = package_root.join("schema.proto");
+        fs::write(&assumed_file, "message Example {}").unwrap();
+        let metadata = CargoMetadata {
+            packages: vec![CargoPackage {
+                name: "package".to_string(),
+                version: "0.1.0".to_string(),
+                source: None,
+                targets: Vec::new(),
+                manifest_path: package_root.join("Cargo.toml"),
+                dependencies: Vec::new(),
+            }],
+            workspace_root: root.clone(),
+            target_directory: root.join("target"),
+        };
+        let config = MainConfig {
+            parser: ParserConfig {
+                assume: true,
+                assume_patterns: HashSet::from(["*.proto".to_string()]),
+                ..ParserConfig::default()
+            },
+            ..MainConfig::default()
+        };
+
+        let tree = build_tree(&mut TestHost::new(), &metadata, &[&metadata.packages[0]], &config);
+
+        assert_eq!(tree.children[0].children.len(), 1);
+        assert_eq!(tree.children[0].children[0].kind, FileKind::Assume);
+        assert_eq!(tree.children[0].children[0].path, assumed_file);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

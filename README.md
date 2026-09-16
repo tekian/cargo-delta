@@ -5,7 +5,7 @@
 [![Coverage](https://codecov.io/gh/tekian/cargo-delta/graph/badge.svg)](https://codecov.io/gh/tekian/cargo-delta)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-`cargo-delta` detects which crates in a Cargo workspace are impacted by changes in a Git feature branch. Build, test, and benchmark only the crates you need.
+`cargo-delta` detects which packages in a Cargo workspace are impacted by changes in a Git feature branch. Build, test, and benchmark only the packages you need.
 
 - [Installation](#installation)
 - [Usage](#usage)
@@ -62,7 +62,7 @@ cargo install cargo-delta
    into `cargo`, change the format:
 
    ```bash
-   # One crate per line — good for xargs / shell loops.
+   # One package per line — good for xargs / shell loops.
    cargo delta impact --baseline main.json --current feature.json -f names --affected
 
    # `-p NAME` pairs — drop into any cargo invocation via $(...).
@@ -87,7 +87,7 @@ cargo install cargo-delta
 
 ### CI/CD Integration
 
-`cargo-delta` is designed to speed up PR builds by building and testing only impacted crates.
+`cargo-delta` is designed to speed up PR builds by building and testing only impacted packages.
 Since detection is best-effort, a **backstop build** must run separately to catch anything delta missed or was misconfigured for.
 
 **PR pipeline** — snapshot both branches, then capture each tier into its own
@@ -96,7 +96,7 @@ variable. Different cargo commands need different tiers:
 | Command | Tier | Reasoning |
 |---|---|---|
 | `cargo fmt --check`, `cargo clippy` | `--modified` | Lints and formatting only matter for code the PR actually touched. Untouched code already passed on `main`. |
-| `cargo build`, `cargo test`, `cargo bench` | `--affected` | A modified crate can break a dependent's compile or behavior, so downstream needs to be built and tested too. |
+| `cargo build`, `cargo test`, `cargo bench` | `--affected` | A modified package can break a dependent's compile or behavior, so downstream needs to be built and tested too. |
 | `cargo doc`, vendor verification | `--required` | Needs transitive dependencies in scope. |
 
 ```yaml
@@ -106,7 +106,7 @@ variable. Different cargo commands need different tiers:
 - name: Snapshot current (PR)
   run: git checkout $PR_BRANCH && cargo delta snapshot > current.json
 
-- name: Build, test, lint impacted crates
+- name: Build, test, lint impacted packages
   run: |
     MODIFIED=$(cargo delta impact --baseline baseline.json --current current.json -f cargo-args --modified)
     AFFECTED=$(cargo delta impact --baseline baseline.json --current current.json -f cargo-args --affected)
@@ -150,7 +150,7 @@ cargo delta snapshot -c config.toml # ...
 cargo delta impact -c config.toml # ...
 ```
 
-Configuration options can be set globally and overridden per crate. For example:
+Configuration options can be set globally and overridden per package. For example:
 
 ```toml
 [parser]
@@ -158,7 +158,7 @@ foo = true
 foo_patterns = ["*.foo", "*.bar"]
 
 [parser.my-crate]
-foo_patterns = ["*.baz"] # Override for a specific crate
+foo_patterns = ["*.baz"] # Override for a specific package
 ```
 
 Default settings are provided in [`config.toml.example`](./config.toml.example).
@@ -255,7 +255,7 @@ file_exclude_patterns = ["target/**", "*.tmp"]
 
 ### Trip Wire
 
-If any changed or deleted file matches a trip wire pattern, all crates are considered impacted.
+If any changed or deleted file matches a trip wire pattern, all packages are considered impacted.
 
 Config default:
 
@@ -280,17 +280,79 @@ trip_wire_patterns = [
 `cargo delta snapshot` writes a JSON artifact describing the workspace at the
 current checkout. It's the input to `cargo delta impact`.
 
-- **files**: Nested tree of file dependencies as detected by all the heuristics.
-- **crates**: Dependency relationships between crates within the workspace.
+- **`files`** is the nested tree of detected inputs. Each package manifest node
+  records its `name@version` package ID.
+- **`packages`** maps each workspace package ID to its direct workspace
+  dependency IDs.
+
+For example:
+
+```json
+{
+  "files": {
+    "path": "Cargo.toml",
+    "kind": "Workspace",
+    "children": [
+      {
+        "path": "crates/app/Cargo.toml",
+        "kind": "Package",
+        "package": "app@1.0.0",
+        "children": []
+      }
+    ]
+  },
+  "packages": {
+    "packages": {
+      "app@1.0.0": ["core@1.0.0"],
+      "core@1.0.0": []
+    }
+  }
+}
+```
+
+Write the JSON to stdout or directly to a file:
+
+```bash
+cargo delta snapshot > snapshot.json
+cargo delta snapshot --output snapshot.json
+```
 
 ### Impact
 
 `cargo delta impact` compares two snapshots plus the git diff and prints which
-crates are impacted, in a JSON shape your CI/CD can consume.
+packages are impacted, in a shape your CI/CD can consume.
 
-- **Modified**: Crates directly modified by Git changes.
-- **Affected**: Modified crates plus all their dependents, direct and indirect.
-- **Required**: Affected crates plus all their dependencies, direct and indirect.
+- **Modified**: Packages directly modified by Git changes.
+- **Affected**: Modified packages plus all their dependents, direct and indirect.
+- **Required**: Affected packages plus all their dependencies, direct and indirect.
+
+By default, the Git diff uses `[git].remote_branch` or the discovered primary
+branch. Use `--base-ref REF` to select it explicitly:
+
+```bash
+cargo delta impact --baseline main.json --current feature.json --base-ref origin/main
+```
+
+`-f`/`--format` controls the emitted representation:
+
+| Format | Output |
+|---|---|
+| `json` | Selected impact tiers as package-name arrays. |
+| `names` | One package name per line. |
+| `cargo-args` | One line of `-p NAME` arguments. |
+| `cargo-args-versioned` | One line of `-p NAME@VERSION` arguments. |
+| `cargo-excludes` | One line of `--exclude NAME` arguments for unselected workspace packages. |
+| `cargo-excludes-versioned` | One line of `--exclude NAME@VERSION` arguments for unselected workspace packages. |
+| `gamma-test-packages` | One line of repeated `--test-package NAME` arguments for `cargo gamma run`. |
+| `packages` | One `name@version` package ID per line. |
+
+Use `--output PATH` to write the same output directly instead of relying on
+shell redirection:
+
+```bash
+cargo delta impact --baseline main.json --current feature.json --affected -f packages
+cargo delta impact --baseline main.json --current feature.json --affected -f packages --output affected.packages
+```
 
 
 ## Limitations
@@ -333,10 +395,10 @@ Using current analysis  : feature.json
   ]
 }
 
-Modified      2 (Crates directly modified by Git changes.)
-Affected      3 (Modified crates plus all their dependents, direct and indirect.)
-Required      4 (Affected crates plus all their dependencies, direct and indirect.)
-Total        15 (Total crates in this workspace.)
+Modified      2 (Packages directly modified by Git changes.)
+Affected      3 (Modified packages plus all their dependents, direct and indirect.)
+Required      4 (Affected packages plus all their dependencies, direct and indirect.)
+Total        15 (Total packages in this workspace.)
 ```
 
 ## Contributing
