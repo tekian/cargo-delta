@@ -341,6 +341,27 @@ directories and exclude the output file from the digest.
 snapshots. The snapshots map changed, deleted, and newly discovered inputs to
 packages and provide the dependency graph used to calculate impact.
 
+#### How impact is calculated
+
+Each invocation performs these steps:
+
+1. Resolve the merge base between `HEAD` and the selected base ref.
+2. Ask Git for tracked files changed or deleted between that commit and the
+   current working tree. This includes committed, staged, and unstaged changes.
+3. Query non-ignored untracked files separately, because `git diff` does not
+   report them, and treat those paths as changed.
+4. Use the current snapshot to map changed and newly discovered paths to
+   packages. Use the baseline snapshot for deleted paths, which no longer exist
+   in the current workspace.
+5. Expand the modified packages through the current dependency graph to produce
+   the affected and required tiers.
+
+Snapshot caching avoids rebuilding file ownership and dependency information,
+but it does not cache the Git change set. Every impact invocation reruns the Git
+queries. It also fingerprints changes relative to `HEAD`—including untracked
+paths and contents—to verify whether the current snapshot cache entry is still
+valid.
+
 - **Modified**: Packages directly modified by Git changes.
 - **Affected**: Modified packages plus all their dependents, direct and indirect.
 - **Required**: Affected packages plus all their dependencies, direct and indirect.
