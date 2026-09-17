@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -18,6 +19,17 @@ pub struct MainConfig {
     pub trip_wire_patterns: Vec<String>,
     #[serde(flatten)]
     pub crate_configs: HashMap<String, ParserConfig>,
+}
+
+pub struct LoadedConfig {
+    pub value: MainConfig,
+    digest: String,
+}
+
+impl LoadedConfig {
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,17 +106,18 @@ impl MainConfig {
     }
 }
 
-pub fn load_config(config_path: Option<PathBuf>) -> Result<MainConfig> {
-    match config_path {
+pub fn load_config(config_path: Option<PathBuf>) -> Result<LoadedConfig> {
+    let (value, source) = match config_path {
         Some(path) => {
             let content = std::fs::read_to_string(&path).map_err(Error::ConfigRead)?;
-
-            let config: MainConfig = toml::from_str(&content)?;
-
-            Ok(config)
+            (toml::from_str(&content)?, content.into_bytes())
         }
-        None => Ok(MainConfig::default()),
-    }
+        None => (MainConfig::default(), b"<defaults>".to_vec()),
+    };
+    Ok(LoadedConfig {
+        value,
+        digest: format!("{:x}", Sha256::digest(source)),
+    })
 }
 
 #[cfg(test)]
@@ -146,7 +159,7 @@ mod tests {
     #[test]
     fn load_config_returns_default_when_none() {
         let config = load_config(None).unwrap();
-        assert!(config.file_exclude_patterns.contains(&".*".to_string()));
+        assert!(config.value.file_exclude_patterns.contains(&".*".to_string()));
     }
 
     #[test]

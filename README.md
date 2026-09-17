@@ -39,59 +39,70 @@ cargo install cargo-delta
 
 ### Quick Start
 
-1. **Snapshot the baseline branch:**
-   ```bash
-   git checkout main
-   cargo delta snapshot > main.json
-   ```
+Run impact analysis directly from the feature branch:
 
-2. **Snapshot the feature branch:**
-   ```bash
-   git checkout feature-branch
-   cargo delta snapshot > feature.json
-   ```
+```bash
+cargo delta impact --base-ref origin/main
+```
 
-3. **Compute the impact:**
-   ```bash
-   cargo delta impact --baseline main.json --current feature.json
-   ```
+Cargo-delta resolves the merge base, snapshots both it and the current working
+tree, and caches the snapshots under `target/cargo-delta/`. Later invocations
+reuse each snapshot while its embedded state key still matches. The comparison
+includes committed, staged, unstaged, deleted, and non-ignored untracked files.
 
-   By default this prints the full `Impact` JSON with all three tiers. Use the
-   tier toggles (`--modified`, `--affected`, `--required`) to filter — when none
-   are given, all three are included (back-compat). To plug the result straight
-   into `cargo`, change the format:
+By default the command prints the full `Impact` JSON with all three tiers. Use
+the tier toggles (`--modified`, `--affected`, `--required`) to filter. To plug
+the result straight into `cargo`, change the format:
 
-   ```bash
-   # One package per line — good for xargs / shell loops.
-   cargo delta impact --baseline main.json --current feature.json -f names --affected
+```bash
+# One package per line — good for xargs / shell loops.
+cargo delta impact --base-ref origin/main -f names --affected
 
-   # `-p NAME` pairs — drop into any cargo invocation via $(...).
-   cargo build $(cargo delta impact --baseline main.json --current feature.json -f cargo-args --affected)
+# `-p NAME` pairs — drop into any cargo invocation via $(...).
+cargo build $(cargo delta impact --base-ref origin/main -f cargo-args --affected)
 
-   # `--exclude NAME` for the workspace complement of the selected tier — combine
-   # with `cargo --workspace` to scope without `-p` ambiguity (since `--exclude`
-   # only matches workspace members, it can't collide with same-named registry
-   # deps). Empty when the selected tier covers the workspace.
-   cargo build --workspace $(cargo delta impact --baseline main.json --current feature.json -f cargo-excludes --affected)
+# `--exclude NAME` for the workspace complement of the selected tier.
+cargo build --workspace $(cargo delta impact --base-ref origin/main -f cargo-excludes --affected)
 
-   # JSON, but only the keys you care about:
-   cargo delta impact --baseline main.json --current feature.json --required
-   ```
+# JSON, but only the keys you care about:
+cargo delta impact --base-ref origin/main --required
+```
 
-   Combining tier toggles for `names` / `cargo-args` emits the **union** of the
-   selected tiers (deduplicated, sorted). The human-readable summary is written
-   to stderr, so `$(...)` capture stays clean.
+Combining tier toggles for non-JSON formats emits the **union** of the selected
+tiers (deduplicated, sorted). The human-readable summary is written to stderr,
+so `$(...)` capture stays clean.
 
-   > The legacy subcommand names `analyze` (= `snapshot`) and `run` (= `impact`)
-   > continue to work as hidden aliases for back-compat.
+#### Explicit snapshot generation
+
+Use `cargo delta snapshot` when snapshots must be generated or transferred
+separately:
+
+```bash
+git checkout main
+cargo delta snapshot --output main.json
+
+git checkout feature-branch
+cargo delta snapshot --output feature.json
+
+cargo delta impact --baseline main.json --current feature.json
+```
+
+These are the same cache-keyed snapshot artifacts used by managed mode. They can
+also prepopulate `target/cargo-delta/baseline.json` and
+`target/cargo-delta/current.json`; a baseline cache entry must describe the
+exact merge-base checkout. Prefer `--output` for arbitrary destinations so the
+output file is excluded from its own working-tree digest.
+
+> The legacy subcommand names `analyze` (= `snapshot`) and `run` (= `impact`)
+> continue to work as hidden aliases for back-compat.
 
 ### CI/CD Integration
 
 `cargo-delta` is designed to speed up PR builds by building and testing only impacted packages.
 Since detection is best-effort, a **backstop build** must run separately to catch anything delta missed or was misconfigured for.
 
-**PR pipeline** — snapshot both branches, then capture each tier into its own
-variable. Different cargo commands need different tiers:
+**PR pipeline** — compare the PR working tree directly with the target branch.
+Different cargo commands need different tiers:
 
 | Command | Tier | Reasoning |
 |---|---|---|
@@ -100,16 +111,10 @@ variable. Different cargo commands need different tiers:
 | `cargo doc`, vendor verification | `--required` | Needs transitive dependencies in scope. |
 
 ```yaml
-- name: Snapshot baseline (main)
-  run: git checkout origin/main && cargo delta snapshot > baseline.json
-
-- name: Snapshot current (PR)
-  run: git checkout $PR_BRANCH && cargo delta snapshot > current.json
-
 - name: Build, test, lint impacted packages
   run: |
-    MODIFIED=$(cargo delta impact --baseline baseline.json --current current.json -f cargo-args --modified)
-    AFFECTED=$(cargo delta impact --baseline baseline.json --current current.json -f cargo-args --affected)
+    MODIFIED=$(cargo delta impact --base-ref origin/main -f cargo-args --modified)
+    AFFECTED=$(cargo delta impact --base-ref origin/main -f cargo-args --affected)
     echo "Modified: $MODIFIED"
     echo "Affected: $AFFECTED"
 
@@ -127,8 +132,8 @@ Notes:
   `-p foo -p bar` into separate cargo arguments.
 - If a tier ends up empty, the corresponding cargo command falls back to its
   workspace default. Add `[ -z "$AFFECTED" ] && exit 0` if you'd rather skip.
-- The two `cargo delta impact` calls are cheap — they re-read the same snapshots
-  and do the same set computation; no need to deduplicate.
+- The first call generates any missing or stale snapshot. Later calls reuse the
+  matching cache entries and only repeat the inexpensive impact calculation.
 
 **Backstop pipeline** — full build without delta, runs post-merge and/or on a nightly schedule:
 
@@ -277,8 +282,14 @@ trip_wire_patterns = [
 
 ### Snapshot
 
-`cargo delta snapshot` writes a JSON artifact describing the workspace at the
-current checkout. It's the input to `cargo delta impact`.
+`cargo delta snapshot` writes the same cache-keyed JSON artifact that managed
+impact generation stores under `target/cargo-delta/`. It describes the workspace
+at the current checkout and can be used as an explicit impact input or placed
+directly at a managed cache path.
+
+Snapshot generation requires the Cargo workspace to be inside a Git worktree.
+The snapshot records the resolved `HEAD` commit and uses Git-root-relative paths;
+outside Git, the command exits with an error and does not write a snapshot.
 
 - **`files`** is the nested tree of detected inputs. Each package manifest node
   records its `name@version` package ID.
@@ -315,23 +326,69 @@ Write the JSON to stdout or directly to a file:
 ```bash
 cargo delta snapshot > snapshot.json
 cargo delta snapshot --output snapshot.json
+
+# Prepopulate the managed current cache entry, creating its directory if needed.
+cargo delta snapshot --output target/cargo-delta/current.json
+
+# Shell redirection produces the same entry when the directory already exists.
+cargo delta snapshot > target/cargo-delta/current.json
 ```
+
+The managed cache directory is always excluded from the snapshot's working-tree
+digest, so both `current.json` commands produce a directly reusable cache entry.
+For other destinations, prefer `--output` so cargo-delta can create parent
+directories and exclude the output file from the digest.
 
 ### Impact
 
-`cargo delta impact` compares two snapshots plus the git diff and prints which
-packages are impacted, in a shape your CI/CD can consume.
+`cargo delta impact` combines the Git change set with the baseline and current
+snapshots. The snapshots map changed, deleted, and newly discovered inputs to
+packages and provide the dependency graph used to calculate impact.
+
+#### How impact is calculated
+
+Each invocation performs these steps:
+
+1. Determine the base commit. `--base-ref` uses its merge base with `HEAD`; a
+   cache-keyed explicit baseline uses the exact `HEAD` commit recorded when it
+   was generated.
+2. Ask Git for tracked files changed or deleted between that commit and the
+   current working tree. This includes committed, staged, and unstaged changes.
+3. Query non-ignored untracked files separately, because `git diff` does not
+   report them, and treat those paths as changed.
+4. Use the current snapshot to map changed and newly discovered paths to
+   packages. Use the baseline snapshot for deleted paths, which no longer exist
+   in the current workspace.
+5. Expand the modified packages through the current dependency graph to produce
+   the affected and required tiers.
+
+Snapshot caching avoids rebuilding file ownership and dependency information,
+but it does not cache the Git change set. Every impact invocation reruns the Git
+queries. It also fingerprints changes relative to `HEAD`—including untracked
+paths and contents—to verify whether the current snapshot cache entry is still
+valid. The same untracked-file listing is reused for change detection and the
+fingerprint.
 
 - **Modified**: Packages directly modified by Git changes.
 - **Affected**: Modified packages plus all their dependents, direct and indirect.
 - **Required**: Affected packages plus all their dependencies, direct and indirect.
 
-By default, the Git diff uses `[git].remote_branch` or the discovered primary
-branch. Use `--base-ref REF` to select it explicitly:
+Use `--base-ref REF` for the primary cached workflow:
 
 ```bash
-cargo delta impact --baseline main.json --current feature.json --base-ref origin/main
+cargo delta impact --base-ref origin/main
 ```
+
+An explicit baseline generated by the current cargo-delta version supplies the
+exact Git commit used for the change set:
+
+```bash
+cargo delta impact --baseline main.json --current feature.json
+```
+
+The baseline must describe a clean checkout because its digest cannot reconstruct
+uncommitted baseline content. Explicit baseline and current snapshots must both
+contain a `cache_key`; older keyless artifacts are rejected as invalid.
 
 `-f`/`--format` controls the emitted representation:
 
@@ -354,6 +411,27 @@ cargo delta impact --baseline main.json --current feature.json --affected -f pac
 cargo delta impact --baseline main.json --current feature.json --affected -f packages --output affected.packages
 ```
 
+`--current` is optional and overrides current-snapshot generation. Supplying an
+explicit `--baseline` is mutually exclusive with `--base-ref`; when
+`--baseline` is used alone, the current snapshot is still managed:
+
+```bash
+cargo delta impact --base-ref origin/main --affected -f cargo-args-versioned
+cargo delta impact --baseline main.json --affected -f cargo-args-versioned
+```
+
+Managed snapshots are stored under Cargo's target directory in
+`cargo-delta/baseline.json` and `cargo-delta/current.json`. Their embedded
+`cache_key` records the checkout commit and working-tree content digest,
+workspace path, configuration digest, and cargo-delta version. A matching
+snapshot is reused regardless of whether cargo-delta generated it implicitly or
+`cargo delta snapshot` wrote it explicitly. An explicit stale snapshot is
+accepted with a warning.
+
+The working-tree comparison includes committed, staged, unstaged, deleted, and
+non-ignored untracked files. If the merge base predates the Cargo workspace,
+all current packages are selected.
+
 
 ## Limitations
 
@@ -367,15 +445,12 @@ This tool is **best-effort** and may not detect all dependencies:
 ## Example
 
 ```bash
-$ cargo delta impact --baseline main.json --current feature.json
+$ cargo delta impact --base-ref origin/main
 Computing impact..
 Looking up git changes..
 
 Changed file: "src/api/mod.rs"
 Changed file: "src/utils.rs"
-
-Using baseline analysis : main.json
-Using current analysis  : feature.json
 
 {
   "Modified": [

@@ -10,15 +10,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use crate::config::MainConfig;
 use crate::crates::{PackageId, Packages, package_name};
-use crate::files::FileNode;
 use crate::git::GitDiff;
+use crate::snapshot::{Snapshot, SnapshotContext};
+use crate::snapshot_cache::SnapshotCache;
 
 mod cargo;
 mod config;
@@ -27,6 +26,8 @@ mod error;
 mod files;
 mod git;
 mod host;
+mod snapshot;
+mod snapshot_cache;
 mod utils;
 
 pub use host::Host;
@@ -76,11 +77,11 @@ enum Commands {
 #[derive(Parser)]
 struct ImpactCommand {
     /// Baseline workspace analysis JSON file (e.g., from main branch)
-    #[arg(long, value_name = "PATH")]
-    baseline: PathBuf,
+    #[arg(long, value_name = "PATH", required_unless_present = "base_ref", conflicts_with = "base_ref")]
+    baseline: Option<PathBuf>,
     /// Current workspace analysis JSON file (e.g., from feature branch)
     #[arg(long, value_name = "PATH")]
-    current: PathBuf,
+    current: Option<PathBuf>,
     /// Compare HEAD with the merge base of this Git ref.
     #[arg(long, value_name = "REF")]
     base_ref: Option<String>,
@@ -179,13 +180,6 @@ struct Impact {
     pub required: HashSet<PackageId>,
 }
 
-#[doc(hidden)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkspaceTree {
-    pub files: FileNode,
-    pub packages: Packages,
-}
-
 /// Run the cargo-delta tool with the given command-line arguments.
 pub fn run(host: &mut impl Host, args: impl IntoIterator<Item = String>) {
     let CargoSubcommand::Delta(cli) = Cli::parse_from(args).command;
@@ -202,7 +196,7 @@ pub fn run(host: &mut impl Host, args: impl IntoIterator<Item = String>) {
     match &cli.command {
         Commands::Impact(cmd) => impact(host, &config, cmd, cli.config.as_ref()),
 
-        Commands::Snapshot(cmd) => snapshot(host, &config, cli.config.as_ref(), cmd.output.as_deref()),
+        Commands::Snapshot(cmd) => snapshot::run(host, &config, cli.config.as_ref(), cmd.output.as_deref()),
     }
 }
 
@@ -214,137 +208,96 @@ fn print_common_props(host: &mut impl Host, config_path: Option<&PathBuf>) {
     }
 }
 
-#[doc(hidden)]
-fn snapshot(host: &mut impl Host, config: &MainConfig, config_path: Option<&PathBuf>, output: Option<&Path>) {
-    let start = Instant::now();
-    let _ = writeln!(host.error(), "Snapshotting workspace..");
-    print_common_props(host, config_path);
+pub(crate) fn write_output_or_exit(host: &mut impl Host, path: Option<&Path>, contents: &str) -> bool {
+    if let Err(error) = host.write_output(path, contents.as_bytes()) {
+        let destination = path.map_or_else(|| "stdout".to_string(), |path| path.display().to_string());
+        let _ = writeln!(host.error(), "Error writing output to {destination}: {error}");
+        host.exit(1);
+        return false;
+    }
+    true
+}
 
-    let metadata = match cargo::metadata(host) {
-        Ok(metadata) => metadata,
-        Err(e) => {
-            let _ = writeln!(host.error(), "Error getting cargo metadata: {e}");
-            host.exit(1);
-            return;
-        }
+fn select_snapshots(
+    host: &mut impl Host,
+    config: &config::LoadedConfig,
+    command: &ImpactCommand,
+) -> error::Result<(Snapshot, Snapshot, git::GitComparison)> {
+    let caller_dir = host
+        .current_dir()
+        .map_err(|error| error::Error::Other(format!("Failed to get current directory: {error}")))?;
+    let git_root = git::get_top_level(host, Some(&caller_dir))?;
+    let metadata = cargo::metadata(host, Some(&caller_dir))
+        .map_err(|error| error::Error::Other(format!("Failed to read current Cargo metadata: {error}")))?;
+    let context = SnapshotContext {
+        config,
+        metadata: &metadata,
+        git_root: &git_root,
+    };
+    let mut excluded_paths = [command.baseline.clone(), command.current.clone(), command.output.clone()]
+        .into_iter()
+        .flatten()
+        .map(|path| if path.is_absolute() { path } else { caller_dir.join(path) })
+        .collect::<Vec<_>>();
+    excluded_paths.push(context.cache_dir());
+
+    let baseline_override = command
+        .baseline
+        .as_deref()
+        .map(|path| Snapshot::load(path, "baseline").map(|snapshot| (path, snapshot)))
+        .transpose()?;
+    let comparison = match baseline_override.as_ref() {
+        Some((path, snapshot)) => git::compare_from_commit(host, &git_root, snapshot.clean_head(path)?, &excluded_paths)?,
+        None => git::compare(
+            host,
+            &git_root,
+            config.value.git.as_ref(),
+            command.base_ref.as_deref(),
+            &excluded_paths,
+        )?,
     };
 
-    let workspace_root = &metadata.workspace_root;
-
-    let git_root = match git::get_top_level(host) {
-        Ok(root) => root,
-        Err(e) => {
-            let _ = writeln!(host.error(), "Error getting git root: {e}");
-            host.exit(1);
-            return;
+    let current_key = context.key(&comparison.current, true)?;
+    let current = match command.current.as_deref() {
+        Some(path) => {
+            let snapshot = Snapshot::load(path, "current")?;
+            snapshot.warn_if_stale(host, path, &current_key, "current");
+            snapshot
         }
+        None => SnapshotCache::new(host, context).current(&comparison.current)?,
     };
-
-    let _ = writeln!(host.error());
-    let _ = writeln!(host.error(), "Detected Git root        : {}", git_root.display());
-    let _ = writeln!(host.error(), "Detected Cargo workspace : {}", workspace_root.display());
-    let _ = writeln!(host.error());
-
-    let packages = cargo::get_workspace_packages(&metadata);
-    let mut files = files::build_tree(host, &metadata, &packages, config);
-    let packages = crates::parse(&metadata);
-
-    files.make_relative_paths(&git_root);
-
-    let _ = writeln!(host.error(), "Found {} package(s) in the workspace.", packages.len());
-    let _ = writeln!(host.error(), "Found {} file(s) in the workspace.", files.len());
-    let _ = writeln!(host.error());
-
-    let workspace_tree = WorkspaceTree { files, packages };
-
-    match serde_json::to_string_pretty(&workspace_tree) {
-        Ok(json_output) => {
-            if !write_output(host, output, &format!("{json_output}\n")) {
-                return;
-            }
+    let baseline_key = context.key(&comparison.base, true)?;
+    let baseline = match baseline_override {
+        Some((path, snapshot)) => {
+            snapshot.warn_if_stale(host, path, &baseline_key, "baseline");
+            snapshot
         }
-        Err(e) => {
-            let _ = writeln!(host.error(), "Error serializing workspace tree to JSON: {e}");
-            host.exit(1);
-            return;
-        }
-    }
-
-    let _ = writeln!(host.error());
-    let excludes: Vec<PathBuf> = workspace_tree.files.distinct().into_iter().collect();
-
-    let unrelated = utils::find_unrelated(&git_root, &excludes, &config.file_exclude_patterns, &config.trip_wire_patterns);
-
-    if !config.file_exclude_patterns.is_empty() {
-        let _ = writeln!(
-            host.error(),
-            "Excluded patterns       : {}",
-            config.file_exclude_patterns.join(", ")
-        );
-    }
-
-    if !config.trip_wire_patterns.is_empty() {
-        let _ = writeln!(host.error(), "Trip wire patterns      : {}", config.trip_wire_patterns.join(", "));
-    }
-
-    if !unrelated.filtered.is_empty() {
-        let _ = writeln!(host.error());
-        let _ = writeln!(host.error(), "Excluded file(s): (filtered out by exclude patterns)");
-        for file in &unrelated.filtered {
-            let _ = writeln!(host.error(), "  {}", file.display());
-        }
-    }
-
-    if !unrelated.trip_wire.is_empty() {
-        let _ = writeln!(host.error());
-        let _ = writeln!(host.error(), "Trip wire file(s): (changes to these trigger a full rebuild)");
-        for file in &unrelated.trip_wire {
-            let _ = writeln!(host.error(), "  {}", file.display());
-        }
-    }
-
-    if !unrelated.unaccounted.is_empty() {
-        let _ = writeln!(host.error());
-        let _ = writeln!(host.error(), "Needs triage: (unknown impact, not matched by any rule)");
-        for file in &unrelated.unaccounted {
-            let _ = writeln!(host.error(), "  {}", file.display());
-        }
-    }
-
-    let duration = start.elapsed();
-    let _ = writeln!(host.error(), "\nSnapshot finished in {duration:.2?}");
+        None => SnapshotCache::new(host, context).baseline(&comparison.base)?,
+    };
+    Ok((baseline, current, comparison))
 }
 
 #[doc(hidden)]
-fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, config_path: Option<&PathBuf>) {
+fn impact(host: &mut impl Host, config: &config::LoadedConfig, command: &ImpactCommand, config_path: Option<&PathBuf>) {
     let _ = writeln!(host.error(), "Computing impact..");
     print_common_props(host, config_path);
     let tiers = TierMask::resolve(command.modified, command.affected, command.required);
 
-    // Get git root to ensure we're working with consistent path bases
-    let git_root = match git::get_top_level(host) {
-        Ok(root) => root,
-        Err(e) => {
-            let _ = writeln!(host.error(), "Error getting git root: {e}");
-            host.exit(1);
-            return;
-        }
-    };
-
     let _ = writeln!(host.error(), "Looking up git changes..");
-
-    let diff = match git::diff(host, &git_root, config.git.as_ref(), command.base_ref.as_deref()) {
-        Ok(i) => i,
-        Err(e) => {
-            let _ = writeln!(host.error(), "Error creating diff: {e}");
+    let (baseline_tree, current_tree, comparison) = match select_snapshots(host, config, command) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            let _ = writeln!(host.error(), "Error resolving impact inputs: {error}");
             host.exit(1);
             return;
         }
     };
+    let widen = !baseline_tree.workspace_present();
+    let diff = comparison.diff;
 
-    if diff.changed.is_empty() && diff.deleted.is_empty() {
+    if diff.changed.is_empty() && diff.deleted.is_empty() && !widen {
         let _ = writeln!(host.error(), "No file has been changed or deleted, quitting.");
-        if !write_output(host, command.output.as_deref(), "") {
+        if !write_output_or_exit(host, command.output.as_deref(), "") {
             return;
         }
         host.exit(0);
@@ -354,35 +307,21 @@ fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, co
     for changed in &diff.changed {
         let _ = writeln!(host.error(), "Changed file: {}", &changed.display());
     }
-
     for deleted in &diff.deleted {
         let _ = writeln!(host.error(), "Deleted file: {}", &deleted.display());
     }
-
-    let _ = writeln!(host.error());
-    let _ = writeln!(host.error(), "Using baseline analysis : {}", command.baseline.display());
-    let _ = writeln!(host.error(), "Using current analysis  : {}", command.current.display());
     let _ = writeln!(host.error());
 
-    let baseline_tree: WorkspaceTree = match utils::deser_json(&command.baseline) {
-        Ok(tree) => tree,
-        Err(e) => {
-            let _ = writeln!(host.error(), "Error loading current workspace tree: {e}");
-            host.exit(1);
-            return;
+    let result = if widen {
+        let packages: HashSet<PackageId> = current_tree.packages.get_all_package_ids().into_iter().collect();
+        Impact {
+            modified: packages.clone(),
+            affected: packages.clone(),
+            required: packages,
         }
+    } else {
+        get_impacted_packages(host, &baseline_tree, &current_tree, &diff, &config.value)
     };
-
-    let current_tree: WorkspaceTree = match utils::deser_json(&command.current) {
-        Ok(tree) => tree,
-        Err(e) => {
-            let _ = writeln!(host.error(), "Error loading branch workspace tree: {e}");
-            host.exit(1);
-            return;
-        }
-    };
-
-    let result = get_impacted_packages(host, &baseline_tree, &current_tree, &diff, config);
 
     if !emit_result(
         host,
@@ -396,11 +335,9 @@ fn impact(host: &mut impl Host, config: &MainConfig, command: &ImpactCommand, co
     }
 
     let total_packages = current_tree.packages.len();
-
     let required_packages_len = result.required.len();
     let affected_packages_len = result.affected.len();
     let modified_packages_len = result.modified.len();
-
     let _ = writeln!(
         host.error(),
         "Modified    {modified_packages_len:>3} (Packages directly modified by Git changes.)"
@@ -494,7 +431,7 @@ fn emit_result(
         }
         OutputFormat::Packages => lines(selected.iter().map(String::as_str)),
     };
-    write_output(host, output, &text)
+    write_output_or_exit(host, output, &text)
 }
 
 fn lines<T: AsRef<str>>(values: impl IntoIterator<Item = T>) -> String {
@@ -509,17 +446,6 @@ fn lines<T: AsRef<str>>(values: impl IntoIterator<Item = T>) -> String {
         rendered.push('\n');
     }
     rendered
-}
-
-fn write_output(host: &mut impl Host, output: Option<&Path>, text: &str) -> bool {
-    let result = output.map_or_else(|| host.output().write_all(text.as_bytes()), |path| fs::write(path, text));
-    if let Err(error) = result {
-        let destination = output.map_or_else(|| "stdout".to_string(), |path| path.display().to_string());
-        let _ = writeln!(host.error(), "Error writing output to {destination}: {error}");
-        host.exit(1);
-        return false;
-    }
-    true
 }
 
 fn sorted_names(set: &HashSet<PackageId>) -> Vec<&str> {
@@ -551,12 +477,13 @@ fn union_of_tiers(result: &Impact, tiers: TierMask) -> Vec<PackageId> {
 #[doc(hidden)]
 fn get_impacted_packages(
     host: &mut impl Host,
-    baseline_tree: &WorkspaceTree,
-    current_tree: &WorkspaceTree,
+    baseline_tree: &Snapshot,
+    current_tree: &Snapshot,
     git_diff: &GitDiff,
     config: &MainConfig,
 ) -> Impact {
     let mut modified = HashSet::new();
+    let mut affected_seeds = HashSet::new();
 
     if !config.trip_wire_patterns.is_empty() {
         use glob::Pattern;
@@ -610,7 +537,17 @@ fn get_impacted_packages(
         let packages_for_file = baseline_tree.files.find_packages_containing_file(deleted_file);
 
         for package in packages_for_file {
-            let _ = modified.insert(package);
+            if let Some(current_package) = current_tree.packages.find_by_name(&package) {
+                let _ = modified.insert(current_package);
+                continue;
+            }
+            if let Some(dependents) = baseline_tree.packages.get_dependents_transitive(&package) {
+                for dependent in dependents {
+                    if let Some(current_dependent) = current_tree.packages.find_by_name(&dependent) {
+                        let _ = affected_seeds.insert(current_dependent);
+                    }
+                }
+            }
         }
     }
 
@@ -635,6 +572,7 @@ fn get_impacted_packages(
 
     // Affected = Modified + all their dependents
     let mut affected = modified.clone();
+    affected.extend(affected_seeds);
     for package in &modified {
         if let Some(transitive_dependents) = current_tree.packages.get_dependents_transitive(package) {
             for dependent in transitive_dependents {
@@ -668,8 +606,9 @@ mod tests {
     use super::*;
     use crate::cargo::{CargoDependency, CargoMetadata, CargoPackage, CargoTarget};
     use crate::crates::package_id;
-    use crate::files::FileKind;
+    use crate::files::{FileKind, FileNode};
     use crate::test_helpers::*;
+    use std::fs;
 
     fn id(name: &str) -> PackageId {
         package_id(name, "0.1.0")
@@ -717,7 +656,7 @@ mod tests {
         root
     }
 
-    fn make_workspace(package_defs: &[(&str, &[&str], &[&str])]) -> WorkspaceTree {
+    fn make_workspace(package_defs: &[(&str, &[&str], &[&str])]) -> Snapshot {
         let deps: Vec<(&str, &[&str])> = package_defs.iter().map(|(name, _, deps)| (*name, *deps)).collect();
         let package_files: Vec<(&str, &[&str])> = package_defs.iter().map(|(name, files, _)| (*name, *files)).collect();
 
@@ -725,7 +664,17 @@ mod tests {
         let files = make_file_tree(&package_files);
         let packages = crates::parse(&metadata);
 
-        WorkspaceTree { files, packages }
+        Snapshot {
+            cache_key: None,
+            files,
+            packages,
+        }
+    }
+
+    fn make_keyed_workspace(package_defs: &[(&str, &[&str], &[&str])], head: &str) -> Snapshot {
+        let mut tree = make_workspace(package_defs);
+        tree.cache_key = Some(snapshot::SnapshotKey::clean_test_key(head));
+        tree
     }
 
     // --- get_impacted_packages tests ---
@@ -935,6 +884,20 @@ mod tests {
 
         let m = TierMask::resolve(false, true, true);
         assert!(!m.modified && m.affected && m.required);
+    }
+
+    #[test]
+    fn cached_and_explicit_snapshot_options_have_expected_relationships() {
+        let _cached = Cli::try_parse_from(["cargo", "delta", "impact", "--base-ref", "origin/main"]).unwrap();
+        let _generated_current = Cli::try_parse_from(["cargo", "delta", "impact", "--baseline", "base.json"]).unwrap();
+        let _explicit_current =
+            Cli::try_parse_from(["cargo", "delta", "impact", "--base-ref", "origin/main", "--current", "current.json"]).unwrap();
+        let _conflict = Cli::try_parse_from(["cargo", "delta", "impact", "--baseline", "base.json", "--base-ref", "origin/main"])
+            .err()
+            .expect("baseline and base-ref must conflict");
+        let _missing_baseline = Cli::try_parse_from(["cargo", "delta", "impact", "--current", "current.json"])
+            .err()
+            .expect("baseline or base-ref must be required");
     }
 
     #[test]
@@ -1277,10 +1240,15 @@ mod tests {
             workspace_root: root.clone(),
             target_directory: root.join("target"),
         };
-        let mut host = TestHost::new().with_commands(vec![
-            Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
-            Ok(success_output(&format!("{}\n", root.display()))),
-        ]);
+        let mut host = TestHost::new()
+            .with_commands(vec![
+                Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
+                Ok(success_output(&format!("{}\n", root.display()))),
+                Ok(success_output("head\n")),
+                Ok(success_output("")),
+                Ok(success_output("")),
+            ])
+            .with_output_error("injected output failure");
 
         run(
             &mut host,
@@ -1289,7 +1257,7 @@ mod tests {
                 "delta".to_string(),
                 "snapshot".to_string(),
                 "--output".to_string(),
-                root.display().to_string(),
+                root.join("snapshot.json").display().to_string(),
             ],
         );
 
@@ -1301,45 +1269,120 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn run_subcommand_no_changes_exits_zero() {
+    fn snapshot_requires_a_git_worktree() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-snapshot-no-git-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let output = root.join("snapshot.json");
+        let metadata = CargoMetadata {
+            packages: Vec::new(),
+            workspace_root: root.clone(),
+            target_directory: root.join("target"),
+        };
         let mut host = TestHost::new().with_commands(vec![
-            Ok(success_output("/fake/root\n")),             // git rev-parse
-            Ok(success_output("abc\trefs/heads/master\n")), // git ls-remote (master found)
-            Ok(success_output("abc123\n")),                 // git merge-base
-            Ok(success_output("")),                         // git diff (no changes)
+            Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
+            Ok(failure_output("fatal: not a git repository")),
+        ]);
+
+        run(
+            &mut host,
+            [
+                "cargo".to_string(),
+                "delta".to_string(),
+                "snapshot".to_string(),
+                "--output".to_string(),
+                output.display().to_string(),
+            ],
+        );
+
+        assert_eq!(host.exit_code, Some(1));
+        assert!(host.stderr_str().contains("not a git repository"));
+        assert!(!output.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn run_subcommand_no_changes_exits_zero() {
+        let tmp = std::env::temp_dir().join(format!("cargo-delta-test-run-no-changes-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let snapshot = serde_json::to_string_pretty(&make_keyed_workspace(&[], "abc123")).unwrap();
+        let baseline = tmp.join("baseline.json");
+        let current = tmp.join("current.json");
+        fs::write(&baseline, &snapshot).unwrap();
+        fs::write(&current, snapshot).unwrap();
+        let metadata = CargoMetadata {
+            packages: Vec::new(),
+            workspace_root: tmp.clone(),
+            target_directory: tmp.join("target"),
+        };
+        let mut host = TestHost::new().with_commands(vec![
+            Ok(success_output(&format!("{}\n", tmp.display()))), // git rev-parse
+            Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
+            Ok(success_output("abc123\n")), // HEAD
+            Ok(success_output("")),         // working-tree digest
+            Ok(success_output("")),         // untracked files
+            Ok(success_output("")),         // changed files
         ]);
 
         // Uses the legacy "run" alias to guard against accidental alias removal.
         run(
             &mut host,
-            ["cargo", "delta", "run", "--baseline", "fake.json", "--current", "fake.json"]
-                .iter()
-                .map(ToString::to_string),
+            [
+                "cargo".to_string(),
+                "delta".to_string(),
+                "run".to_string(),
+                "--baseline".to_string(),
+                baseline.display().to_string(),
+                "--current".to_string(),
+                current.display().to_string(),
+            ],
         );
 
-        assert_eq!(host.exit_code, Some(0));
+        assert_eq!(host.exit_code, Some(0), "{}", host.stderr_str());
         assert!(host.stderr_str().contains("No file has been changed"));
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn impact_subcommand_canonical_name_works() {
+        let tmp = std::env::temp_dir().join(format!("cargo-delta-test-impact-name-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let snapshot = serde_json::to_string_pretty(&make_keyed_workspace(&[], "abc123")).unwrap();
+        let baseline = tmp.join("baseline.json");
+        let current = tmp.join("current.json");
+        fs::write(&baseline, &snapshot).unwrap();
+        fs::write(&current, snapshot).unwrap();
+        let metadata = CargoMetadata {
+            packages: Vec::new(),
+            workspace_root: tmp.clone(),
+            target_directory: tmp.join("target"),
+        };
         let mut host = TestHost::new().with_commands(vec![
-            Ok(success_output("/fake/root\n")),
-            Ok(success_output("abc\trefs/heads/master\n")),
+            Ok(success_output(&format!("{}\n", tmp.display()))),
+            Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
             Ok(success_output("abc123\n")),
+            Ok(success_output("")),
+            Ok(success_output("")),
             Ok(success_output("")),
         ]);
 
         run(
             &mut host,
-            ["cargo", "delta", "impact", "--baseline", "fake.json", "--current", "fake.json"]
-                .iter()
-                .map(ToString::to_string),
+            [
+                "cargo".to_string(),
+                "delta".to_string(),
+                "impact".to_string(),
+                "--baseline".to_string(),
+                baseline.display().to_string(),
+                "--current".to_string(),
+                current.display().to_string(),
+            ],
         );
 
-        assert_eq!(host.exit_code, Some(0));
+        assert_eq!(host.exit_code, Some(0), "{}", host.stderr_str());
         assert!(host.stderr_str().contains("Computing impact"));
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
@@ -1348,19 +1391,28 @@ mod tests {
         let tmp = std::env::temp_dir().join("cargo_delta_test_run_changes");
         let _ = fs::create_dir_all(&tmp);
 
-        let tree = make_workspace(&[("app", &["app/src/main.rs"], &["lib"]), ("lib", &["lib/src/lib.rs"], &[])]);
+        let tree = make_keyed_workspace(
+            &[("app", &["app/src/main.rs"], &["lib"]), ("lib", &["lib/src/lib.rs"], &[])],
+            "abc123",
+        );
         let json = serde_json::to_string_pretty(&tree).unwrap();
         let baseline_path = tmp.join("baseline.json");
         let current_path = tmp.join("current.json");
         fs::write(&baseline_path, &json).unwrap();
         fs::write(&current_path, &json).unwrap();
 
-        let git_root = tmp.to_string_lossy().to_string();
+        let metadata = CargoMetadata {
+            packages: Vec::new(),
+            workspace_root: tmp.clone(),
+            target_directory: tmp.join("target"),
+        };
         let mut host = TestHost::new().with_commands(vec![
-            Ok(success_output(&format!("{git_root}\n"))),   // git rev-parse
-            Ok(success_output("abc\trefs/heads/master\n")), // git ls-remote
-            Ok(success_output("abc123\n")),                 // git merge-base
-            Ok(success_output("lib/src/lib.rs\n")),         // git diff (one file)
+            Ok(success_output(&format!("{}\n", tmp.display()))), // git rev-parse
+            Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
+            Ok(success_output("head\n")),
+            Ok(success_output("")),
+            Ok(success_output("")),
+            Ok(success_output("D\0lib/src/lib.rs\0")),
         ]);
 
         run(
@@ -1392,18 +1444,29 @@ mod tests {
     fn impact_stops_after_output_write_failure() {
         let root = std::env::temp_dir().join(format!("cargo-delta-impact-write-failure-{}", std::process::id()));
         fs::create_dir_all(root.join("lib/src")).unwrap();
+        let output = root.join("output.json");
         fs::write(root.join("lib/src/lib.rs"), "pub fn value() {}\n").unwrap();
-        let tree = make_workspace(&[("lib", &["lib/src/lib.rs"], &[])]);
+        let tree = make_keyed_workspace(&[("lib", &["lib/src/lib.rs"], &[])], "abc123");
         let snapshot = serde_json::to_string_pretty(&tree).unwrap();
         let baseline = root.join("baseline.json");
         let current = root.join("current.json");
         fs::write(&baseline, &snapshot).unwrap();
         fs::write(&current, &snapshot).unwrap();
-        let mut host = TestHost::new().with_commands(vec![
-            Ok(success_output(&format!("{}\n", root.display()))),
-            Ok(success_output("abc123\n")),
-            Ok(success_output("lib/src/lib.rs\n")),
-        ]);
+        let metadata = CargoMetadata {
+            packages: Vec::new(),
+            workspace_root: root.clone(),
+            target_directory: root.join("target"),
+        };
+        let mut host = TestHost::new()
+            .with_commands(vec![
+                Ok(success_output(&format!("{}\n", root.display()))),
+                Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
+                Ok(success_output("head\n")),
+                Ok(success_output("")),
+                Ok(success_output("")),
+                Ok(success_output("M\0lib/src/lib.rs\0")),
+            ])
+            .with_output_error("injected output failure");
 
         run(
             &mut host,
@@ -1415,16 +1478,14 @@ mod tests {
                 baseline.display().to_string(),
                 "--current".to_string(),
                 current.display().to_string(),
-                "--base-ref".to_string(),
-                "origin/main".to_string(),
                 "--output".to_string(),
-                root.display().to_string(),
+                output.display().to_string(),
             ],
         );
 
         assert_eq!(host.exit_code, Some(1));
         assert!(host.stderr_str().contains("Error writing output"));
-        assert!(!host.stderr_str().contains("Modified"));
+        assert!(!host.stderr_str().contains("Modified    "));
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -2,6 +2,8 @@ use crate::error::{Error, Result};
 use crate::host::Host;
 use normpath::PathExt;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,8 +37,12 @@ pub struct CargoDependency {
 }
 
 /// Get cargo metadata from current working directory
-pub fn metadata(host: &mut impl Host) -> Result<CargoMetadata> {
-    let output = host.run_command("cargo", &["metadata", "--format-version", "1", "--no-deps"], None)?;
+pub fn metadata(host: &mut impl Host, working_dir: Option<&Path>) -> Result<CargoMetadata> {
+    let cargo = host
+        .env_var_os("CARGO")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsStr::new("cargo").to_os_string());
+    let output = host.run_command(&cargo, &["metadata", "--format-version", "1", "--no-deps"], working_dir)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -83,7 +89,7 @@ mod tests {
 
         let mut host = TestHost::new().with_commands(vec![Ok(success_output(&json.to_string()))]);
 
-        let result = metadata(&mut host).unwrap();
+        let result = metadata(&mut host, None).unwrap();
         assert_eq!(result.packages.len(), 1);
         assert_eq!(result.packages[0].name, "my-crate");
         assert_eq!(result.packages[0].version, "0.1.0");
@@ -91,10 +97,29 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
+    fn metadata_uses_the_invoking_cargo_executable() {
+        let json = serde_json::json!({
+            "packages": [],
+            "workspace_root": ".",
+            "target_directory": "target"
+        });
+        let cargo = PathBuf::from("toolchain with spaces").join("cargo");
+        let mut host = TestHost::new()
+            .with_env_var("CARGO", cargo.clone())
+            .with_commands(vec![Ok(success_output(&json.to_string()))]);
+
+        let _metadata = metadata(&mut host, Some(Path::new("workspace"))).unwrap();
+
+        assert_eq!(host.command_calls[0].0, cargo);
+        assert_eq!(host.command_calls[0].2.as_deref(), Some(Path::new("workspace")));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn metadata_returns_error_on_command_failure() {
         let mut host = TestHost::new().with_commands(vec![Ok(failure_output("cargo not found"))]);
 
-        let result = metadata(&mut host);
+        let result = metadata(&mut host, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cargo not found"));
     }
@@ -104,7 +129,7 @@ mod tests {
     fn metadata_returns_error_on_invalid_json() {
         let mut host = TestHost::new().with_commands(vec![Ok(success_output("not valid json"))]);
 
-        let result = metadata(&mut host);
+        let result = metadata(&mut host, None);
         let _ = result.unwrap_err();
     }
 
@@ -112,7 +137,7 @@ mod tests {
     fn metadata_returns_error_on_io_failure() {
         let mut host = TestHost::new().with_commands(vec![Err(std::io::Error::new(std::io::ErrorKind::NotFound, "cargo not installed"))]);
 
-        let result = metadata(&mut host);
+        let result = metadata(&mut host, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cargo not installed"));
     }
