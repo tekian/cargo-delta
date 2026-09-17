@@ -91,8 +91,8 @@ a required `cache_key`, so there is no separate cache-entry artifact or
 generation path. `cargo delta snapshot` and cached impact generation use the
 same snapshot builder and produce directly interchangeable files.
 
-Every key includes the cargo-delta/cache version, workspace path, and
-configuration digest. Every snapshot source is represented uniformly as `HEAD`
+Every key includes the cargo-delta version, workspace path, and configuration
+digest. Every snapshot source is represented uniformly as `HEAD`
 plus a digest of tracked worktree changes and non-ignored untracked paths and
 contents. The cached baseline is the merge-base commit with the empty
 working-tree digest. Explicit snapshots are used as requested, but cargo-delta

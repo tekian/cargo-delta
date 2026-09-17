@@ -13,11 +13,8 @@ use crate::host::Host;
 use crate::output;
 use crate::utils;
 
-const CACHE_VERSION: u32 = 1;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotKey {
-    cache_version: u32,
     cargo_delta_version: String,
     workspace: PathBuf,
     config_sha256: String,
@@ -27,8 +24,7 @@ pub struct SnapshotKey {
 
 impl SnapshotKey {
     fn matches(&self, other: &Self) -> bool {
-        self.cache_version == other.cache_version
-            && self.cargo_delta_version == other.cargo_delta_version
+        self.cargo_delta_version == other.cargo_delta_version
             && self.workspace == other.workspace
             && self.config_sha256 == other.config_sha256
             && self.source == other.source
@@ -39,7 +35,6 @@ impl SnapshotKey {
         use sha2::Digest as _;
 
         Self {
-            cache_version: CACHE_VERSION,
             cargo_delta_version: env!("CARGO_PKG_VERSION").to_string(),
             workspace: PathBuf::new(),
             config_sha256: format!("{:x}", sha2::Sha256::digest(b"<defaults>")),
@@ -134,7 +129,6 @@ pub struct SnapshotContext<'a> {
 impl SnapshotContext<'_> {
     pub fn key(&self, source: &CheckoutState, workspace_present: bool) -> Result<SnapshotKey> {
         Ok(SnapshotKey {
-            cache_version: CACHE_VERSION,
             cargo_delta_version: env!("CARGO_PKG_VERSION").to_string(),
             workspace: self.workspace_relative_path()?,
             config_sha256: self.config.digest().to_string(),
