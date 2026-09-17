@@ -1,4 +1,5 @@
 use normpath::PathExt;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::fs;
@@ -17,8 +18,32 @@ pub struct GitDiff {
 
 #[derive(Debug, Clone)]
 pub struct GitComparison {
-    pub base_commit: String,
+    pub base: CheckoutState,
+    pub current: CheckoutState,
     pub diff: GitDiff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutState {
+    head: String,
+    working_tree_sha256: String,
+}
+
+impl CheckoutState {
+    pub fn clean(head: &str) -> Self {
+        Self {
+            head: head.to_string(),
+            working_tree_sha256: clean_working_tree_digest(),
+        }
+    }
+
+    pub fn head(&self) -> &str {
+        &self.head
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.working_tree_sha256 == clean_working_tree_digest()
+    }
 }
 
 enum GitBranch<'a> {
@@ -40,7 +65,6 @@ pub fn compare(
     workspace_path: &Path,
     config: Option<&GitConfig>,
     base_ref: Option<&str>,
-    include_worktree: bool,
     excluded_paths: &[PathBuf],
 ) -> Result<GitComparison> {
     let remote_branch = if let Some(base_ref) = base_ref {
@@ -70,64 +94,30 @@ pub fn compare(
         .trim()
         .to_string();
 
-    compare_from_commit(host, workspace_path, &merge_base, include_worktree, excluded_paths)
+    compare_from_commit(host, workspace_path, &merge_base, excluded_paths)
 }
 
 pub fn compare_from_commit(
     host: &mut impl Host,
     workspace_path: &Path,
     base_commit: &str,
-    include_worktree: bool,
     excluded_paths: &[PathBuf],
 ) -> Result<GitComparison> {
-    if include_worktree {
-        return Ok(GitComparison {
-            diff: working_tree_diff(host, workspace_path, base_commit, excluded_paths)?,
-            base_commit: base_commit.to_string(),
-        });
-    }
-
-    let diff_arg = format!("{base_commit}..HEAD");
-    let diff_output = host
-        .run_command("git", &["diff", "--name-only", &diff_arg], Some(workspace_path))
-        .map_err(|e| Error::Git(format!("Failed to run git diff: {e}")))?;
-
-    if !diff_output.status.success() {
-        let stderr = String::from_utf8_lossy(&diff_output.stderr);
-        return Err(Error::Git(format!("git diff failed: {stderr}")));
-    }
-
-    let diff_output_str =
-        String::from_utf8(diff_output.stdout).map_err(|e| Error::Git(format!("Invalid UTF-8 in git diff output: {e}")))?;
-
-    let all_file_paths: Vec<PathBuf> = diff_output_str
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let path = workspace_path.join(line.trim());
-            path.normalize().map_or_else(|_| path.clone(), normpath::BasePathBuf::into_path_buf)
-        })
-        .collect();
-
-    let changed: Vec<PathBuf> = all_file_paths
-        .iter()
-        .filter(|path| path.exists())
-        .filter_map(|path| path.strip_prefix(workspace_path).ok().map(Path::to_path_buf))
-        .collect();
-
-    let deleted: Vec<PathBuf> = all_file_paths
-        .iter()
-        .filter(|path| !path.exists())
-        .filter_map(|path| path.strip_prefix(workspace_path).ok().map(Path::to_path_buf))
-        .collect();
-
+    let (current, untracked) = inspect_checkout(host, workspace_path, excluded_paths)?;
     Ok(GitComparison {
-        base_commit: base_commit.to_string(),
-        diff: GitDiff { changed, deleted },
+        base: CheckoutState::clean(base_commit),
+        current,
+        diff: working_tree_diff(host, workspace_path, base_commit, excluded_paths, untracked)?,
     })
 }
 
-fn working_tree_diff(host: &mut impl Host, workspace_path: &Path, base_commit: &str, excluded_paths: &[PathBuf]) -> Result<GitDiff> {
+fn working_tree_diff(
+    host: &mut impl Host,
+    workspace_path: &Path,
+    base_commit: &str,
+    excluded_paths: &[PathBuf],
+    untracked: Vec<PathBuf>,
+) -> Result<GitDiff> {
     let diff_output = host
         .run_command(
             "git",
@@ -162,23 +152,7 @@ fn working_tree_diff(host: &mut impl Host, workspace_path: &Path, base_commit: &
         }
     }
 
-    let untracked = host
-        .run_command(
-            "git",
-            &["ls-files", "--others", "--exclude-standard", "-z", "--"],
-            Some(workspace_path),
-        )
-        .map_err(|error| Error::Git(format!("Failed to list untracked files: {error}")))?;
-    if !untracked.status.success() {
-        return Err(Error::Git(format!(
-            "git ls-files failed: {}",
-            String::from_utf8_lossy(&untracked.stderr)
-        )));
-    }
-    for path in untracked.stdout.split(|byte| *byte == 0).filter(|path| !path.is_empty()) {
-        let path = PathBuf::from(
-            String::from_utf8(path.to_vec()).map_err(|error| Error::Git(format!("Invalid UTF-8 in untracked path: {error}")))?,
-        );
+    for path in untracked {
         if !is_excluded(workspace_path, &path, excluded_paths) {
             changed.push(path);
         }
@@ -190,11 +164,12 @@ fn working_tree_diff(host: &mut impl Host, workspace_path: &Path, base_commit: &
     Ok(GitDiff { changed, deleted })
 }
 
-pub fn head_commit(host: &mut impl Host, git_root: &Path) -> Result<String> {
-    git_stdout(host, git_root, &["rev-parse", "--verify", "HEAD^{commit}"], "resolve HEAD")
+pub fn checkout_state(host: &mut impl Host, git_root: &Path, excluded_paths: &[PathBuf]) -> Result<CheckoutState> {
+    inspect_checkout(host, git_root, excluded_paths).map(|(state, _untracked)| state)
 }
 
-pub fn working_tree_digest(host: &mut impl Host, git_root: &Path, excluded_paths: &[PathBuf]) -> Result<String> {
+fn inspect_checkout(host: &mut impl Host, git_root: &Path, excluded_paths: &[PathBuf]) -> Result<(CheckoutState, Vec<PathBuf>)> {
+    let head = git_stdout(host, git_root, &["rev-parse", "--verify", "HEAD^{commit}"], "resolve HEAD")?;
     let excluded = excluded_pathspecs(git_root, excluded_paths);
     let mut diff_args = vec![
         "diff".to_string(),
@@ -237,17 +212,29 @@ pub fn working_tree_digest(host: &mut impl Host, git_root: &Path, excluded_paths
     let mut hasher = Sha256::new();
     hasher.update(&diff.stdout);
     hasher.update([0]);
+    let mut untracked_paths = Vec::new();
     for path in untracked.stdout.split(|byte| *byte == 0).filter(|path| !path.is_empty()) {
         hasher.update(path);
         hasher.update([0]);
         let path_text =
             String::from_utf8(path.to_vec()).map_err(|error| Error::Git(format!("Invalid UTF-8 in untracked path: {error}")))?;
+        untracked_paths.push(PathBuf::from(&path_text));
         let contents = fs::read(git_root.join(path_text))
             .map_err(|error| Error::Git(format!("Failed to read untracked file for fingerprint: {error}")))?;
         hasher.update(u64::try_from(contents.len()).unwrap_or(u64::MAX).to_le_bytes());
         hasher.update(contents);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok((
+        CheckoutState {
+            head,
+            working_tree_sha256: format!("{:x}", hasher.finalize()),
+        },
+        untracked_paths,
+    ))
+}
+
+fn clean_working_tree_digest() -> String {
+    format!("{:x}", Sha256::digest([0]))
 }
 
 fn excluded_pathspecs(git_root: &Path, paths: &[PathBuf]) -> Vec<String> {
@@ -446,11 +433,14 @@ mod tests {
         };
 
         let mut host = TestHost::new().with_commands(vec![
-            Ok(success_output("abc123\n")),     // merge-base
-            Ok(success_output("src/lib.rs\n")), // diff
+            Ok(success_output("abc123\n")),        // merge-base
+            Ok(success_output("head\n")),          // HEAD
+            Ok(success_output("")),                // working-tree digest
+            Ok(success_output("")),                // untracked files
+            Ok(success_output("M\0src/lib.rs\0")), // changed files
         ]);
 
-        let result = compare(&mut host, &tmp, Some(&git_config), None, false, &[]).unwrap().diff;
+        let result = compare(&mut host, &tmp, Some(&git_config), None, &[]).unwrap().diff;
 
         assert_eq!(result.changed.len(), 1);
         assert!(result.deleted.is_empty());
@@ -465,9 +455,15 @@ mod tests {
     fn diff_with_explicit_base_ref_skips_discovery() {
         let tmp = std::env::temp_dir().join("cargo_delta_test_diff_base_ref");
         let _ = fs::create_dir_all(&tmp);
-        let mut host = TestHost::new().with_commands(vec![Ok(success_output("abc123\n")), Ok(success_output(""))]);
+        let mut host = TestHost::new().with_commands(vec![
+            Ok(success_output("abc123\n")),
+            Ok(success_output("head\n")),
+            Ok(success_output("")),
+            Ok(success_output("")),
+            Ok(success_output("")),
+        ]);
 
-        let result = compare(&mut host, &tmp, None, Some("origin/explicit"), false, &[]).unwrap().diff;
+        let result = compare(&mut host, &tmp, None, Some("origin/explicit"), &[]).unwrap().diff;
 
         assert!(result.changed.is_empty());
         assert!(!host.stderr_str().contains("No remote branch specified"));
@@ -477,17 +473,24 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn working_tree_comparison_includes_tracked_deleted_and_untracked_paths() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-git-comparison-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/new.rs"), "new").unwrap();
         let mut host = TestHost::new().with_commands(vec![
             Ok(success_output("merge-base\n")),
-            Ok(success_output("M\0src/lib.rs\0D\0src/old.rs\0")),
+            Ok(success_output("head\n")),
+            Ok(success_output("tracked diff")),
             Ok(success_output("src/new.rs\0")),
+            Ok(success_output("M\0src/lib.rs\0D\0src/old.rs\0")),
         ]);
 
-        let comparison = compare(&mut host, Path::new("/repo"), None, Some("origin/main"), true, &[]).unwrap();
+        let comparison = compare(&mut host, &root, None, Some("origin/main"), &[]).unwrap();
 
-        assert_eq!(comparison.base_commit, "merge-base");
+        assert_eq!(comparison.base.head(), "merge-base");
+        assert_eq!(comparison.current.head(), "head");
         assert_eq!(comparison.diff.changed, [PathBuf::from("src/lib.rs"), PathBuf::from("src/new.rs")]);
         assert_eq!(comparison.diff.deleted, [PathBuf::from("src/old.rs")]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -495,8 +498,10 @@ mod tests {
     fn working_tree_comparison_excludes_requested_subtrees() {
         let mut host = TestHost::new().with_commands(vec![
             Ok(success_output("merge-base\n")),
-            Ok(success_output("M\0generated/cache.json\0M\0src/lib.rs\0")),
-            Ok(success_output("generated/new.json\0src/new.rs\0")),
+            Ok(success_output("head\n")),
+            Ok(success_output("")),
+            Ok(success_output("")),
+            Ok(success_output("M\0generated/cache.json\0M\0src/lib.rs\0M\0src/new.rs\0")),
         ]);
 
         let comparison = compare(
@@ -504,7 +509,6 @@ mod tests {
             Path::new("/repo"),
             None,
             Some("origin/main"),
-            true,
             &[PathBuf::from("/repo/generated")],
         )
         .unwrap();
@@ -540,7 +544,7 @@ mod tests {
 
         let mut host = TestHost::new().with_commands(vec![Ok(failure_output("fatal: not a valid commit"))]);
 
-        let result = compare(&mut host, &tmp, Some(&git_config), None, false, &[]);
+        let result = compare(&mut host, &tmp, Some(&git_config), None, &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("merge-base"));
 

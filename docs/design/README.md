@@ -70,7 +70,7 @@ An explicit `--baseline` is mutually exclusive with `--base-ref`. An explicit
 side is omitted, cargo-delta uses the cached snapshot when its embedded key is
 current and regenerates it otherwise.
 
-Managed comparison resolves `merge-base(HEAD, REF)` and compares that commit
+Cached comparison resolves `merge-base(HEAD, REF)` and compares that commit
 with the current working tree. It includes committed, staged, unstaged,
 deleted, and non-ignored untracked paths.
 
@@ -88,20 +88,20 @@ affected and required traversal.
 Generated snapshots are cached as `target/cargo-delta/baseline.json` and
 `target/cargo-delta/current.json`. The ordinary snapshot JSON is extended with
 a required `cache_key`, so there is no separate cache-entry artifact or
-generation path. `cargo delta snapshot` and managed impact generation use the
+generation path. `cargo delta snapshot` and cached impact generation use the
 same snapshot builder and produce directly interchangeable files.
 
 Every key includes the cargo-delta/cache version, workspace path, and
 configuration digest. Every snapshot source is represented uniformly as `HEAD`
 plus a digest of tracked worktree changes and non-ignored untracked paths and
-contents. The managed baseline is the merge-base commit with the empty
+contents. The cached baseline is the merge-base commit with the empty
 working-tree digest. Explicit snapshots are used as requested, but cargo-delta
-warns when their embedded key does not match the state being compared or is
-absent.
+warns when their embedded key does not match the state being compared. A
+missing key makes the snapshot invalid.
 
 The internal cache directory is always excluded from snapshot state, including
 when shell redirection hides the output path from cargo-delta. Exact explicit
-snapshot and output paths are also excluded from managed current-state
+snapshot and output paths are also excluded from cached current-state
 calculation, so generated artifacts do not invalidate their own cache.
 
 A baseline cache miss creates a detached temporary worktree at the merge base
@@ -113,6 +113,20 @@ success and failure.
 
 If the workspace does not exist at the merge base, cargo-delta writes an empty
 baseline snapshot and widens every impact tier to all current packages.
+
+## Implementation boundaries
+
+- `git` resolves the base commit and returns one `GitComparison` containing the
+  base checkout identity, current checkout identity, and changed paths. The
+  untracked-file query contributes to both current identity and changed paths.
+- `snapshot` defines, constructs, loads, and validates one snapshot and its
+  checkout key.
+- `snapshot_cache` persists snapshots and exposes only `current(state)` and
+  `baseline(state)`. Its baseline method privately owns temporary-worktree
+  creation and cleanup.
+- The impact command selects explicit snapshots or cache methods, then combines
+  the resulting pair with `GitComparison.diff`. Cache details and temporary
+  worktrees do not enter the impact calculation.
 
 `-f packages` emits the selected union as sorted `name@version` package IDs,
 one per line. `cargo-args-versioned` and `cargo-excludes-versioned` place those

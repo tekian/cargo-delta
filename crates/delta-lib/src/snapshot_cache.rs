@@ -1,277 +1,86 @@
 use core::sync::atomic::{AtomicU64, Ordering};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::cargo::CargoMetadata;
-use crate::config::MainConfig;
+use crate::cargo;
 use crate::error::{Error, Result};
-use crate::files::{FileKind, FileNode};
-use crate::git::GitComparison;
+use crate::git::CheckoutState;
 use crate::host::Host;
-use crate::{WorkspaceTree, build_snapshot};
+use crate::snapshot::{Snapshot, SnapshotContext};
+use crate::utils;
 
-const CACHE_VERSION: u32 = 1;
 static NEXT_WORKTREE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotCacheKey {
-    cache_version: u32,
-    cargo_delta_version: String,
-    workspace: PathBuf,
-    config_sha256: String,
-    source: SnapshotSource,
-    workspace_present: bool,
+pub struct SnapshotCache<'a, H> {
+    host: &'a mut H,
+    context: SnapshotContext<'a>,
+    cache_dir: PathBuf,
 }
 
-fn clean_working_tree_digest() -> String {
-    format!("{:x}", Sha256::digest([0]))
-}
-
-impl SnapshotCacheKey {
-    fn matches_identity(&self, other: &Self) -> bool {
-        self.cache_version == other.cache_version
-            && self.cargo_delta_version == other.cargo_delta_version
-            && self.workspace == other.workspace
-            && self.config_sha256 == other.config_sha256
-            && self.source == other.source
+impl<'a, H: Host> SnapshotCache<'a, H> {
+    pub fn new(host: &'a mut H, context: SnapshotContext<'a>) -> Self {
+        let cache_dir = context.cache_dir();
+        Self { host, context, cache_dir }
     }
 
-    pub fn clean_head(&self) -> Option<&str> {
-        (self.source.working_tree_sha256 == clean_working_tree_digest()).then_some(self.source.head.as_str())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clean_test_key(head: &str) -> Self {
-        Self {
-            cache_version: CACHE_VERSION,
-            cargo_delta_version: env!("CARGO_PKG_VERSION").to_string(),
-            workspace: PathBuf::new(),
-            config_sha256: format!("{:x}", Sha256::digest(b"<defaults>")),
-            source: SnapshotSource {
-                head: head.to_string(),
-                working_tree_sha256: clean_working_tree_digest(),
-            },
-            workspace_present: true,
+    pub fn current(&mut self, state: &CheckoutState) -> Result<Snapshot> {
+        let path = self.cache_dir.join("current.json");
+        let key = self.context.key(state, true)?;
+        if let Some(snapshot) = read_cache(&path, &key) {
+            let _ = writeln!(self.host.error(), "Using cached current snapshot: {}", path.display());
+            return Ok(snapshot);
         }
+        let snapshot = Snapshot::build(self.host, &self.context, state)?;
+        write_cache(&path, &snapshot)?;
+        Ok(snapshot)
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SnapshotSource {
-    head: String,
-    working_tree_sha256: String,
-}
-
-pub struct ImpactInputs {
-    pub baseline: WorkspaceTree,
-    pub current: WorkspaceTree,
-    pub diff: crate::git::GitDiff,
-    pub widen: bool,
-}
-
-pub struct ResolveContext<'a> {
-    pub config_path: Option<&'a PathBuf>,
-    pub comparison: GitComparison,
-    pub git_root: &'a Path,
-    pub current_metadata: &'a CargoMetadata,
-    pub baseline: Option<ExplicitSnapshot<'a>>,
-    pub current_path: Option<&'a Path>,
-    pub excluded_paths: &'a [PathBuf],
-}
-
-pub struct ExplicitSnapshot<'a> {
-    pub path: &'a Path,
-    pub tree: WorkspaceTree,
-}
-
-pub fn current_cache_key(
-    host: &mut impl Host,
-    metadata: &CargoMetadata,
-    git_root: &Path,
-    config_path: Option<&PathBuf>,
-    workspace_present: bool,
-    excluded_paths: &[PathBuf],
-) -> Result<SnapshotCacheKey> {
-    Ok(SnapshotCacheKey {
-        cache_version: CACHE_VERSION,
-        cargo_delta_version: env!("CARGO_PKG_VERSION").to_string(),
-        workspace: workspace_relative_path(metadata, git_root)?,
-        config_sha256: config_digest(config_path)?,
-        source: SnapshotSource {
-            head: crate::git::head_commit(host, git_root)?,
-            working_tree_sha256: crate::git::working_tree_digest(host, git_root, excluded_paths)?,
-        },
-        workspace_present,
-    })
-}
-
-pub fn baseline_cache_key(
-    metadata: &CargoMetadata,
-    git_root: &Path,
-    config_path: Option<&PathBuf>,
-    base_commit: &str,
-    workspace_present: bool,
-) -> Result<SnapshotCacheKey> {
-    Ok(SnapshotCacheKey {
-        cache_version: CACHE_VERSION,
-        cargo_delta_version: env!("CARGO_PKG_VERSION").to_string(),
-        workspace: workspace_relative_path(metadata, git_root)?,
-        config_sha256: config_digest(config_path)?,
-        source: SnapshotSource {
-            head: base_commit.to_string(),
-            working_tree_sha256: clean_working_tree_digest(),
-        },
-        workspace_present,
-    })
-}
-
-pub fn resolve(host: &mut impl Host, config: &MainConfig, context: ResolveContext<'_>) -> Result<ImpactInputs> {
-    let ResolveContext {
-        config_path,
-        comparison,
-        git_root,
-        current_metadata,
-        baseline,
-        current_path,
-        excluded_paths,
-    } = context;
-    let cache_dir = current_metadata.target_directory.join("cargo-delta");
-    let mut key_exclusions = excluded_paths.to_vec();
-    key_exclusions.push(cache_dir.clone());
-    let current_key = current_cache_key(host, current_metadata, git_root, config_path, true, &key_exclusions)?;
-    let current = match current_path {
-        Some(path) => load_explicit(host, path, &current_key, "current")?,
-        None => cached_or_create_current(host, config, current_metadata, git_root, &cache_dir, current_key)?,
-    };
-
-    let baseline_key = baseline_cache_key(current_metadata, git_root, config_path, &comparison.base_commit, true)?;
-    let baseline = match baseline {
-        Some(explicit) => {
-            warn_if_stale(host, explicit.path, &explicit.tree, &baseline_key, "baseline")?;
-            explicit.tree
+    pub fn baseline(&mut self, state: &CheckoutState) -> Result<Snapshot> {
+        let cache_path = self.cache_dir.join("baseline.json");
+        let expected_key = self.context.key(state, true)?;
+        if let Some(snapshot) = read_cache(&cache_path, &expected_key) {
+            let _ = writeln!(self.host.error(), "Using cached baseline snapshot: {}", cache_path.display());
+            return Ok(snapshot);
         }
-        None => cached_or_create_baseline(
-            host,
-            config,
-            current_metadata,
-            git_root,
-            &cache_dir,
-            &comparison.base_commit,
-            baseline_key,
-        )?,
-    };
-    let widen = baseline.cache_key.as_ref().is_some_and(|key| !key.workspace_present);
-    Ok(ImpactInputs {
-        baseline,
-        current,
-        diff: comparison.diff,
-        widen,
-    })
-}
 
-fn cached_or_create_current(
-    host: &mut impl Host,
-    config: &MainConfig,
-    metadata: &CargoMetadata,
-    git_root: &Path,
-    cache_dir: &Path,
-    key: SnapshotCacheKey,
-) -> Result<WorkspaceTree> {
-    let path = cache_dir.join("current.json");
-    if let Some(snapshot) = read_cache(&path, &key) {
-        let _ = writeln!(host.error(), "Using cached current snapshot: {}", path.display());
-        return Ok(snapshot);
+        let workspace = self.context.workspace_relative_path()?;
+        let mut worktree = TemporaryWorktree::create(self.host, self.context.git_root, state.head())?;
+        let workspace_dir = worktree.path.join(&workspace);
+        let snapshot_result = if workspace_dir.join("Cargo.toml").is_file() {
+            let metadata = cargo::metadata(self.host, Some(&workspace_dir))
+                .map_err(|error| Error::Other(format!("Failed to read baseline Cargo metadata: {error}")))?;
+            let context = SnapshotContext {
+                config: self.context.config,
+                metadata: &metadata,
+                git_root: &worktree.path,
+            };
+            Snapshot::build(self.host, &context, state)
+        } else {
+            Snapshot::missing_workspace(&self.context, state)
+        };
+        let cleanup_result = worktree.cleanup(self.host);
+        let snapshot = match (snapshot_result, cleanup_result) {
+            (Ok(snapshot), Ok(())) => snapshot,
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(_), Err(cleanup)) => return Err(cleanup),
+            (Err(primary), Err(cleanup)) => {
+                return Err(Error::Other(format!(
+                    "{primary}; additionally, temporary worktree cleanup failed: {cleanup}"
+                )));
+            }
+        };
+        write_cache(&cache_path, &snapshot)?;
+        Ok(snapshot)
     }
-    let snapshot = build_snapshot(host, config, metadata, git_root, Some(key));
-    write_cache(&path, &snapshot)?;
-    Ok(snapshot)
 }
 
-fn cached_or_create_baseline(
-    host: &mut impl Host,
-    config: &MainConfig,
-    current_metadata: &CargoMetadata,
-    git_root: &Path,
-    cache_dir: &Path,
-    base_commit: &str,
-    expected_key: SnapshotCacheKey,
-) -> Result<WorkspaceTree> {
-    let cache_path = cache_dir.join("baseline.json");
-    if let Some(snapshot) = read_cache(&cache_path, &expected_key) {
-        let _ = writeln!(host.error(), "Using cached baseline snapshot: {}", cache_path.display());
-        return Ok(snapshot);
-    }
-
-    let workspace = workspace_relative_path(current_metadata, git_root)?;
-    let mut worktree = TemporaryWorktree::create(host, git_root, base_commit)?;
-    let workspace_dir = worktree.path.join(&workspace);
-    let snapshot_result = if workspace_dir.join("Cargo.toml").is_file() {
-        let metadata = crate::cargo::metadata(host, Some(&workspace_dir))
-            .map_err(|error| Error::Other(format!("Failed to read baseline Cargo metadata: {error}")))?;
-        Ok(build_snapshot(host, config, &metadata, &worktree.path, Some(expected_key)))
-    } else {
-        let mut key = expected_key;
-        key.workspace_present = false;
-        Ok(WorkspaceTree {
-            cache_key: Some(key),
-            files: FileNode::new(workspace.join("Cargo.toml"), FileKind::Workspace),
-            packages: crate::crates::Packages::default(),
-        })
-    };
-    let cleanup_result = worktree.cleanup(host);
-    let snapshot = match (snapshot_result, cleanup_result) {
-        (Ok(snapshot), Ok(())) => snapshot,
-        (Err(primary), Ok(())) => return Err(primary),
-        (Ok(_), Err(cleanup)) => return Err(cleanup),
-        (Err(primary), Err(cleanup)) => {
-            return Err(Error::Other(format!(
-                "{primary}; additionally, temporary worktree cleanup failed: {cleanup}"
-            )));
-        }
-    };
-    write_cache(&cache_path, &snapshot)?;
-    Ok(snapshot)
+fn read_cache(path: &Path, expected: &crate::snapshot::SnapshotKey) -> Option<Snapshot> {
+    let snapshot: Snapshot = utils::deser_json(path).ok()?;
+    snapshot.matches(expected).then_some(snapshot)
 }
 
-fn load_explicit(host: &mut impl Host, path: &Path, expected: &SnapshotCacheKey, label: &str) -> Result<WorkspaceTree> {
-    let snapshot: WorkspaceTree = crate::utils::deser_json(path)?;
-    warn_if_stale(host, path, &snapshot, expected, label)?;
-    Ok(snapshot)
-}
-
-pub fn cache_key<'a>(path: &Path, snapshot: &'a WorkspaceTree, label: &str) -> Result<&'a SnapshotCacheKey> {
-    snapshot.cache_key.as_ref().ok_or_else(|| {
-        Error::Other(format!(
-            "Supplied {label} snapshot '{}' has no cache key and is not a valid snapshot",
-            path.display()
-        ))
-    })
-}
-
-pub fn warn_if_stale(host: &mut impl Host, path: &Path, snapshot: &WorkspaceTree, expected: &SnapshotCacheKey, label: &str) -> Result<()> {
-    if !cache_key(path, snapshot, label)?.matches_identity(expected) {
-        let _ = writeln!(
-            host.error(),
-            "Warning: supplied {label} snapshot '{}' is not up to date for the current comparison",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn read_cache(path: &Path, expected: &SnapshotCacheKey) -> Option<WorkspaceTree> {
-    let snapshot: WorkspaceTree = crate::utils::deser_json(path).ok()?;
-    snapshot
-        .cache_key
-        .as_ref()
-        .is_some_and(|actual| actual.matches_identity(expected))
-        .then_some(snapshot)
-}
-
-fn write_cache(path: &Path, snapshot: &WorkspaceTree) -> Result<()> {
+fn write_cache(path: &Path, snapshot: &Snapshot) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::Other(format!("Cache path '{}' has no parent", path.display())))?;
@@ -280,32 +89,6 @@ fn write_cache(path: &Path, snapshot: &WorkspaceTree) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(snapshot)?;
     bytes.push(b'\n');
     fs::write(path, bytes).map_err(|error| Error::Other(format!("Failed to write snapshot cache '{}': {error}", path.display())))
-}
-
-fn config_digest(config_path: Option<&PathBuf>) -> Result<String> {
-    let contents = match config_path {
-        Some(path) => fs::read(path).map_err(|error| Error::Other(format!("Failed to read config for cache key: {error}")))?,
-        None => b"<defaults>".to_vec(),
-    };
-    Ok(format!("{:x}", Sha256::digest(contents)))
-}
-
-fn workspace_relative_path(metadata: &CargoMetadata, git_root: &Path) -> Result<PathBuf> {
-    let workspace_root = fs::canonicalize(&metadata.workspace_root).map_err(|error| {
-        Error::Other(format!(
-            "Failed to resolve Cargo workspace '{}': {error}",
-            metadata.workspace_root.display()
-        ))
-    })?;
-    let git_root = fs::canonicalize(git_root)
-        .map_err(|error| Error::Other(format!("Failed to resolve Git root '{}': {error}", git_root.display())))?;
-    workspace_root.strip_prefix(&git_root).map(Path::to_path_buf).map_err(|_error| {
-        Error::Other(format!(
-            "Cargo workspace '{}' is outside Git root '{}'",
-            metadata.workspace_root.display(),
-            git_root.display()
-        ))
-    })
 }
 
 struct TemporaryWorktree {
@@ -365,6 +148,7 @@ impl TemporaryWorktree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::ffi::{OsStr, OsString};
     use std::io;
     use std::process::{Command, Output};
@@ -529,21 +313,6 @@ mod tests {
         }
         crate::run(&mut host, args);
         host
-    }
-
-    #[test]
-    fn workspace_path_uses_resolved_filesystem_identity() {
-        let root = std::env::temp_dir().join(format!("cargo-delta-resolved-workspace-{}", std::process::id()));
-        let nested = root.join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        let metadata = CargoMetadata {
-            packages: Vec::new(),
-            workspace_root: nested.join(".."),
-            target_directory: root.join("target"),
-        };
-
-        assert_eq!(workspace_relative_path(&metadata, &root).unwrap(), PathBuf::new());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

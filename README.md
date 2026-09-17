@@ -366,13 +366,14 @@ Snapshot caching avoids rebuilding file ownership and dependency information,
 but it does not cache the Git change set. Every impact invocation reruns the Git
 queries. It also fingerprints changes relative to `HEAD`—including untracked
 paths and contents—to verify whether the current snapshot cache entry is still
-valid.
+valid. The same untracked-file listing is reused for change detection and the
+fingerprint.
 
 - **Modified**: Packages directly modified by Git changes.
 - **Affected**: Modified packages plus all their dependents, direct and indirect.
 - **Required**: Affected packages plus all their dependencies, direct and indirect.
 
-Use `--base-ref REF` for the primary managed workflow:
+Use `--base-ref REF` for the primary cached workflow:
 
 ```bash
 cargo delta impact --base-ref origin/main
