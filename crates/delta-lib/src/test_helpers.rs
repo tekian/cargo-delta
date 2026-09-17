@@ -1,6 +1,7 @@
 use crate::host::Host;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -13,6 +14,7 @@ pub struct TestHost {
     command_responses: VecDeque<io::Result<Output>>,
     current_dir: PathBuf,
     env_vars: HashMap<String, OsString>,
+    output_error: Option<String>,
 }
 
 impl TestHost {
@@ -25,6 +27,7 @@ impl TestHost {
             command_responses: VecDeque::new(),
             current_dir: std::env::current_dir().expect("tests require a current directory"),
             env_vars: HashMap::new(),
+            output_error: None,
         }
     }
 
@@ -38,6 +41,11 @@ impl TestHost {
         self
     }
 
+    pub fn with_output_error(mut self, message: impl Into<String>) -> Self {
+        self.output_error = Some(message.into());
+        self
+    }
+
     pub fn stdout_str(&self) -> String {
         String::from_utf8_lossy(&self.stdout).to_string()
     }
@@ -48,12 +56,26 @@ impl TestHost {
 }
 
 impl Host for TestHost {
-    fn output(&mut self) -> impl Write {
-        &mut self.stdout
-    }
-
     fn error(&mut self) -> impl Write {
         &mut self.stderr
+    }
+
+    fn write_output(&mut self, path: Option<&Path>, contents: &[u8]) -> io::Result<()> {
+        if let Some(message) = &self.output_error {
+            return Err(io::Error::other(message.clone()));
+        }
+        let Some(path) = path else {
+            return self.stdout.write_all(contents);
+        };
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.current_dir.join(path)
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, contents)
     }
 
     fn exit(&mut self, code: i32) {

@@ -26,7 +26,6 @@ mod error;
 mod files;
 mod git;
 mod host;
-mod output;
 mod snapshot;
 mod snapshot_cache;
 mod utils;
@@ -209,6 +208,16 @@ fn print_common_props(host: &mut impl Host, config_path: Option<&PathBuf>) {
     }
 }
 
+pub(crate) fn write_output_or_exit(host: &mut impl Host, path: Option<&Path>, contents: &str) -> bool {
+    if let Err(error) = host.write_output(path, contents.as_bytes()) {
+        let destination = path.map_or_else(|| "stdout".to_string(), |path| path.display().to_string());
+        let _ = writeln!(host.error(), "Error writing output to {destination}: {error}");
+        host.exit(1);
+        return false;
+    }
+    true
+}
+
 fn select_snapshots(
     host: &mut impl Host,
     config: &config::LoadedConfig,
@@ -288,7 +297,7 @@ fn impact(host: &mut impl Host, config: &config::LoadedConfig, command: &ImpactC
 
     if diff.changed.is_empty() && diff.deleted.is_empty() && !widen {
         let _ = writeln!(host.error(), "No file has been changed or deleted, quitting.");
-        if !output::write(host, command.output.as_deref(), "") {
+        if !write_output_or_exit(host, command.output.as_deref(), "") {
             return;
         }
         host.exit(0);
@@ -422,7 +431,7 @@ fn emit_result(
         }
         OutputFormat::Packages => lines(selected.iter().map(String::as_str)),
     };
-    output::write(host, output, &text)
+    write_output_or_exit(host, output, &text)
 }
 
 fn lines<T: AsRef<str>>(values: impl IntoIterator<Item = T>) -> String {
@@ -1231,13 +1240,15 @@ mod tests {
             workspace_root: root.clone(),
             target_directory: root.join("target"),
         };
-        let mut host = TestHost::new().with_commands(vec![
-            Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
-            Ok(success_output(&format!("{}\n", root.display()))),
-            Ok(success_output("head\n")),
-            Ok(success_output("")),
-            Ok(success_output("")),
-        ]);
+        let mut host = TestHost::new()
+            .with_commands(vec![
+                Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
+                Ok(success_output(&format!("{}\n", root.display()))),
+                Ok(success_output("head\n")),
+                Ok(success_output("")),
+                Ok(success_output("")),
+            ])
+            .with_output_error("injected output failure");
 
         run(
             &mut host,
@@ -1246,7 +1257,7 @@ mod tests {
                 "delta".to_string(),
                 "snapshot".to_string(),
                 "--output".to_string(),
-                root.display().to_string(),
+                root.join("snapshot.json").display().to_string(),
             ],
         );
 
@@ -1433,8 +1444,7 @@ mod tests {
     fn impact_stops_after_output_write_failure() {
         let root = std::env::temp_dir().join(format!("cargo-delta-impact-write-failure-{}", std::process::id()));
         fs::create_dir_all(root.join("lib/src")).unwrap();
-        let output = root.join("output");
-        fs::create_dir_all(&output).unwrap();
+        let output = root.join("output.json");
         fs::write(root.join("lib/src/lib.rs"), "pub fn value() {}\n").unwrap();
         let tree = make_keyed_workspace(&[("lib", &["lib/src/lib.rs"], &[])], "abc123");
         let snapshot = serde_json::to_string_pretty(&tree).unwrap();
@@ -1447,14 +1457,16 @@ mod tests {
             workspace_root: root.clone(),
             target_directory: root.join("target"),
         };
-        let mut host = TestHost::new().with_commands(vec![
-            Ok(success_output(&format!("{}\n", root.display()))),
-            Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
-            Ok(success_output("head\n")),
-            Ok(success_output("")),
-            Ok(success_output("")),
-            Ok(success_output("M\0lib/src/lib.rs\0")),
-        ]);
+        let mut host = TestHost::new()
+            .with_commands(vec![
+                Ok(success_output(&format!("{}\n", root.display()))),
+                Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
+                Ok(success_output("head\n")),
+                Ok(success_output("")),
+                Ok(success_output("")),
+                Ok(success_output("M\0lib/src/lib.rs\0")),
+            ])
+            .with_output_error("injected output failure");
 
         run(
             &mut host,

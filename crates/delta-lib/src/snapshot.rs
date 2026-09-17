@@ -10,7 +10,6 @@ use crate::error::{Error, Result};
 use crate::files::{self, FileKind, FileNode};
 use crate::git::CheckoutState;
 use crate::host::Host;
-use crate::output;
 use crate::utils;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,7 +230,7 @@ pub fn run(host: &mut impl Host, config: &LoadedConfig, config_path: Option<&Pat
             return;
         }
     };
-    if !output::write(host, output_path, &json) {
+    if !crate::write_output_or_exit(host, output_path, &json) {
         return;
     }
 

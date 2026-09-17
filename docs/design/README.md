@@ -127,6 +127,8 @@ baseline snapshot and widens every impact tier to all current packages.
 - The impact command selects explicit snapshots or cache methods, then combines
   the resulting pair with `GitComparison.diff`. Cache details and temporary
   worktrees do not enter the impact calculation.
+- `Host::write_output` owns destination resolution and output I/O. Command code
+  owns user-facing error reporting and exit behavior.
 
 `-f packages` emits the selected union as sorted `name@version` package IDs,
 one per line. `cargo-args-versioned` and `cargo-excludes-versioned` place those

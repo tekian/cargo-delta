@@ -4,6 +4,7 @@
 
 use cargo_delta_lib::Host;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::io::{self, Write, stderr, stdout};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -13,12 +14,23 @@ use std::process::{Command, Output};
 pub struct RealHost;
 
 impl Host for RealHost {
-    fn output(&mut self) -> impl Write {
-        stdout()
-    }
-
     fn error(&mut self) -> impl Write {
         stderr()
+    }
+
+    fn write_output(&mut self, path: Option<&Path>, contents: &[u8]) -> io::Result<()> {
+        let Some(path) = path else {
+            return stdout().write_all(contents);
+        };
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.current_dir()?.join(path)
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, contents)
     }
 
     fn exit(&mut self, code: i32) {
@@ -56,5 +68,17 @@ mod tests {
         let host = RealHost;
         assert_eq!(host.current_dir().unwrap(), std::env::current_dir().unwrap());
         assert_eq!(host.env_var_os("PATH"), std::env::var_os("PATH"));
+    }
+
+    #[test]
+    fn real_host_writes_output_file() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-real-host-output-{}", std::process::id()));
+        let path = root.join("nested/output.txt");
+        let mut host = RealHost;
+
+        host.write_output(Some(&path), b"output").unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "output");
+        fs::remove_dir_all(root).unwrap();
     }
 }

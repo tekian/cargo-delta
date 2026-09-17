@@ -192,12 +192,23 @@ mod tests {
     }
 
     impl Host for ProcessHost {
-        fn output(&mut self) -> impl Write {
-            &mut self.stdout
-        }
-
         fn error(&mut self) -> impl Write {
             &mut self.stderr
+        }
+
+        fn write_output(&mut self, path: Option<&Path>, contents: &[u8]) -> io::Result<()> {
+            let Some(path) = path else {
+                return self.stdout.write_all(contents);
+            };
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.current_dir.join(path)
+            };
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, contents)
         }
 
         fn exit(&mut self, code: i32) {
