@@ -416,16 +416,16 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn file_at_reads_existing_path() {
-        let mut host = TestHost::new().with_commands(vec![Ok(success_output("Cargo.lock\0")), Ok(success_output("lock contents"))]);
+        let mut host = TestHost::new().with_commands(vec![Ok(success_output("Cargo.toml\0")), Ok(success_output("manifest"))]);
 
-        let contents = file_at(&mut host, Path::new("/repo"), "base", Path::new("Cargo.lock")).unwrap();
+        let contents = file_at(&mut host, Path::new("/repo"), "base", Path::new("Cargo.toml")).unwrap();
 
-        assert_eq!(contents, Some(b"lock contents".to_vec()));
+        assert_eq!(contents, Some(b"manifest".to_vec()));
         assert_eq!(
             host.command_calls[0].1,
-            ["ls-tree", "--name-only", "-z", "base", "--", "Cargo.lock"]
+            ["ls-tree", "--name-only", "-z", "base", "--", "Cargo.toml"]
         );
-        assert_eq!(host.command_calls[1].1, ["show", "base:Cargo.lock"]);
+        assert_eq!(host.command_calls[1].1, ["show", "base:Cargo.toml"]);
     }
 
     #[test]
@@ -433,7 +433,7 @@ mod tests {
     fn file_at_returns_none_for_missing_path() {
         let mut host = TestHost::new().with_commands(vec![Ok(success_output(""))]);
 
-        let contents = file_at(&mut host, Path::new("/repo"), "base", Path::new("Cargo.lock")).unwrap();
+        let contents = file_at(&mut host, Path::new("/repo"), "base", Path::new("Cargo.toml")).unwrap();
 
         assert!(contents.is_none());
         assert_eq!(host.command_calls.len(), 1);

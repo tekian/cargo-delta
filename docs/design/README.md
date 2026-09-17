@@ -100,17 +100,18 @@ affected and required traversal.
 Git remains the only change detector. Cargo-specific processing runs only when
 the Git change set contains the workspace `Cargo.lock` or root `Cargo.toml`.
 
-For a changed lockfile, cargo-delta reads the baseline content with `git show`
-and the current working-tree content from disk. It parses both files into maps
-keyed by package name, version, and source; checksum and normalized dependency
-lists are compared values. Removed or changed baseline identities are looked up
-in the baseline package records, and added or changed current identities in the
-current records. The union of nearest workspace consumers becomes modified.
+For a changed lockfile, cargo-delta compares each matching workspace package's
+baseline and current external resolution graph. An external record contains its
+name, version, source, and direct resolved external dependencies. Packages
+whose graph differs become modified. Cargo-delta does not parse `Cargo.lock`;
+formatting, unused entries, and checksum-only edits do not change package-build
+scope when Cargo reports the same resolution.
 
 External traversal stops when it reaches another workspace package. If
-`app -> core -> external`, `core` records `external` while `app` records only
-its workspace edge to `core`; an external change therefore makes `core`
-modified and `app` affected.
+`app -> core -> external`, `core` records the external graph while `app`
+records only its workspace edge to `core`; an external change therefore makes
+`core` modified and `app` affected. Direct edges are retained so rewiring
+between the same set of external package identities is still observable.
 
 For a changed root manifest, cargo-delta parses both TOML documents and removes
 only `workspace.dependencies`, `workspace.members`, and `workspace.exclude`

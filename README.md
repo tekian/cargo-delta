@@ -372,11 +372,16 @@ Each invocation performs these steps:
 5. Expand the modified packages through the current dependency graph to produce
    the affected and required tiers.
 
-When Git reports the workspace `Cargo.lock` changed, cargo-delta parses the
-baseline and current lockfiles and compares package identity, checksum, and
-dependency lists. Changed external package identities are mapped through each
-snapshot's `external_dependencies`. Only their nearest workspace consumers are
-modified; workspace dependents become affected through the existing graph.
+When Git reports the workspace `Cargo.lock` changed, cargo-delta compares each
+workspace package's baseline and current `external_dependencies` graph.
+External records contain package identity, version, source, and direct resolved
+dependencies. Packages whose external graph changed are modified; workspace
+dependents become affected through the existing local graph. Cargo-delta does
+not parse the lockfile.
+
+Lockfile formatting, unused entries, and checksum-only edits do not change
+package-build scope when Cargo reports the same resolution. Cargo and unscoped
+lock-integrity checks remain responsible for validating those changes.
 
 When Git reports the root `Cargo.toml` changed, cargo-delta compares the
 manifests semantically. Changes confined to `[workspace.dependencies]`,

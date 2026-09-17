@@ -31,8 +31,12 @@ impl<'a, H: Host> SnapshotCache<'a, H> {
             let _ = writeln!(self.host.error(), "Using cached current snapshot: {}", path.display());
             return Ok(snapshot);
         }
-        let metadata = cargo::snapshot_metadata(self.host, Some(&self.context.metadata.workspace_root))
-            .map_err(|error| Error::Other(format!("Failed to read resolved current Cargo metadata: {error}")))?;
+        let metadata = cargo::complete_snapshot_metadata(
+            self.host,
+            Some(&self.context.metadata.workspace_root),
+            self.context.metadata.clone(),
+        )
+        .map_err(|error| Error::Other(format!("Failed to read resolved current Cargo metadata: {error}")))?;
         let context = SnapshotContext {
             config: self.context.config,
             metadata: &metadata,
@@ -194,6 +198,13 @@ mod tests {
             self.command_calls
                 .iter()
                 .filter(|(command, args)| command == "git" && args.starts_with(&["worktree".to_string(), "remove".to_string()]))
+                .count()
+        }
+
+        fn metadata_calls(&self) -> usize {
+            self.command_calls
+                .iter()
+                .filter(|(_command, args)| args.first().is_some_and(|argument| argument == "metadata"))
                 .count()
         }
     }
@@ -417,6 +428,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&output_file).unwrap(), "workspace-lib@1.2.3\n");
         assert_eq!(first.worktree_adds(), 1);
         assert_eq!(first.worktree_removes(), 1);
+        assert_eq!(first.metadata_calls(), 2);
         let cached_current: serde_json::Value =
             serde_json::from_slice(&fs::read(workspace.join("target/cargo-delta/current.json")).unwrap()).unwrap();
         assert_eq!(
@@ -443,6 +455,7 @@ mod tests {
         assert!(second.stderr().contains("Using cached current snapshot"));
         assert!(!second.stderr().contains("impact.packages"));
         assert_eq!(second.worktree_adds(), 0);
+        assert_eq!(second.metadata_calls(), 1);
 
         write_workspace(&workspace, 3);
         let stale = invoke_with_current(&caller_workspace, &output, Some(&stale_current));

@@ -1,9 +1,8 @@
-use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::crates::{ExternalPackageId, PackageId};
+use crate::crates::PackageId;
 use crate::error::{Error, Result};
 use crate::git::{CheckoutState, GitDiff};
 use crate::host::Host;
@@ -13,8 +12,8 @@ use crate::snapshot::Snapshot;
 pub struct CargoInputChanges {
     pub modified: HashSet<PackageId>,
     pub affected: HashSet<PackageId>,
-    pub(crate) scoped_paths: HashSet<PathBuf>,
-    pub(crate) global_paths: BTreeSet<PathBuf>,
+    pub scoped_paths: HashSet<PathBuf>,
+    pub global_paths: BTreeSet<PathBuf>,
 }
 
 impl CargoInputChanges {
@@ -39,13 +38,9 @@ pub fn classify(
     let workspace = current.workspace();
     let lock_path = workspace.join("Cargo.lock");
     if contains(diff, &lock_path) && baseline.packages.resolution_complete() && current.packages.resolution_complete() {
-        let baseline_lock = crate::git::file_at(host, git_root, base.head(), &lock_path)?;
-        let current_lock = read_optional(&git_root.join(&lock_path))?;
-        let (removed_or_changed, added_or_changed) = changed_lock_packages(baseline_lock.as_deref(), current_lock.as_deref())?;
         changes
             .modified
-            .extend(baseline.packages.consumers_of_external(&removed_or_changed));
-        changes.modified.extend(current.packages.consumers_of_external(&added_or_changed));
+            .extend(current.packages.changed_external_resolution(&baseline.packages));
         let _ = changes.scoped_paths.insert(lock_path);
     } else if contains(diff, &lock_path) {
         let _ = changes.global_paths.insert(lock_path);
@@ -84,79 +79,6 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(Error::Other(format!("Failed to read Cargo input '{}': {error}", path.display()))),
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct Lockfile {
-    #[serde(default, rename = "package")]
-    packages: Vec<LockedPackage>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct LockedPackage {
-    name: String,
-    version: String,
-    source: Option<String>,
-    checksum: Option<String>,
-    #[serde(default)]
-    dependencies: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LockedValue {
-    checksum: Option<String>,
-    dependencies: Vec<String>,
-}
-
-fn changed_lock_packages(
-    baseline: Option<&[u8]>,
-    current: Option<&[u8]>,
-) -> Result<(HashSet<ExternalPackageId>, HashSet<ExternalPackageId>)> {
-    let baseline = parse_lockfile(baseline)?;
-    let current = parse_lockfile(current)?;
-    let identities: BTreeSet<_> = baseline.keys().chain(current.keys()).cloned().collect();
-    let mut removed_or_changed = HashSet::new();
-    let mut added_or_changed = HashSet::new();
-    for identity in identities {
-        if baseline.get(&identity) == current.get(&identity) {
-            continue;
-        }
-        if baseline.contains_key(&identity) {
-            let _ = removed_or_changed.insert(identity.clone());
-        }
-        if current.contains_key(&identity) {
-            let _ = added_or_changed.insert(identity);
-        }
-    }
-    Ok((removed_or_changed, added_or_changed))
-}
-
-fn parse_lockfile(contents: Option<&[u8]>) -> Result<BTreeMap<ExternalPackageId, LockedValue>> {
-    let Some(contents) = contents else {
-        return Ok(BTreeMap::new());
-    };
-    let text = core::str::from_utf8(contents).map_err(|error| Error::Other(format!("Cargo.lock is not UTF-8: {error}")))?;
-    let lockfile: Lockfile = toml::from_str(text).map_err(|error| Error::Other(format!("Failed to parse Cargo.lock: {error}")))?;
-    Ok(lockfile
-        .packages
-        .into_iter()
-        .map(|package| {
-            let identity = ExternalPackageId {
-                name: package.name,
-                version: package.version,
-                source: package.source,
-            };
-            let mut dependencies = package.dependencies;
-            dependencies.sort();
-            (
-                identity,
-                LockedValue {
-                    checksum: package.checksum,
-                    dependencies,
-                },
-            )
-        })
-        .collect())
 }
 
 fn workspace_global_manifest(contents: Option<&[u8]>) -> Result<Option<toml::Value>> {
@@ -293,24 +215,12 @@ mod tests {
         }
     }
 
-    fn lock(version: &str) -> String {
-        lock_with_checksum(version, version)
-    }
-
-    fn lock_with_checksum(version: &str, checksum: &str) -> String {
-        format!(
-            "version = 4\n\n[[package]]\nname = \"external\"\nversion = \"{version}\"\nsource = \"{SOURCE}\"\nchecksum = \"{checksum}\"\n"
-        )
-    }
-
     #[test]
     fn lock_change_selects_only_external_consumers() {
         let root = std::env::temp_dir().join(format!("cargo-delta-lock-consumers-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("Cargo.lock"), lock("2.0.0")).unwrap();
         let baseline = snapshot(&root, "1.0.0", &[]);
         let current = snapshot(&root, "2.0.0", &[]);
-        let mut host = TestHost::new().with_commands(vec![Ok(success_output("Cargo.lock\0")), Ok(success_output(&lock("1.0.0")))]);
+        let mut host = TestHost::new();
         let diff = GitDiff {
             changed: vec![PathBuf::from("Cargo.lock")],
             deleted: Vec::new(),
@@ -324,18 +234,13 @@ mod tests {
             current.packages.get_dependents_transitive(&"core@0.1.0".to_string()).unwrap(),
             ["app@0.1.0".to_string()]
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn unused_lock_change_selects_no_package() {
-        let baseline = lock("1.0.0") + "\n[[package]]\nname = \"unused\"\nversion = \"1.0.0\"\n";
-        let current = lock("1.0.0") + "\n[[package]]\nname = \"unused\"\nversion = \"2.0.0\"\n";
+    fn unchanged_external_resolution_selects_no_package_when_lock_changes() {
         let root = std::env::temp_dir().join(format!("cargo-delta-unused-lock-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("Cargo.lock"), &current).unwrap();
         let tree = snapshot(&root, "1.0.0", &[]);
-        let mut host = TestHost::new().with_commands(vec![Ok(success_output("Cargo.lock\0")), Ok(success_output(&baseline))]);
+        let mut host = TestHost::new();
         let diff = GitDiff {
             changed: vec![PathBuf::from("Cargo.lock")],
             deleted: Vec::new(),
@@ -345,54 +250,30 @@ mod tests {
 
         assert!(changes.modified.is_empty());
         assert!(changes.is_scoped(Path::new("Cargo.lock")));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn checksum_only_lock_change_selects_consumer() {
-        let root = std::env::temp_dir().join(format!("cargo-delta-lock-checksum-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("Cargo.lock"), lock_with_checksum("1.0.0", "new")).unwrap();
-        let tree = snapshot(&root, "1.0.0", &[]);
-        let mut host = TestHost::new().with_commands(vec![
-            Ok(success_output("Cargo.lock\0")),
-            Ok(success_output(&lock_with_checksum("1.0.0", "old"))),
-        ]);
-        let diff = GitDiff {
-            changed: vec![PathBuf::from("Cargo.lock")],
-            deleted: Vec::new(),
-        };
-
-        let changes = classify(&mut host, &root, &CheckoutState::clean("base"), &diff, &tree, &tree).unwrap();
-
-        assert_eq!(changes.modified, HashSet::from(["core@0.1.0".to_string()]));
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn lock_change_without_resolved_snapshots_remains_unscoped() {
         let root = std::env::temp_dir().join(format!("cargo-delta-lock-incomplete-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("Cargo.lock"), lock("1.0.0")).unwrap();
-        let mut tree = snapshot(&root, "1.0.0", &[]);
-        tree.packages = crates::parse(&CargoMetadata {
+        let complete = snapshot(&root, "1.0.0", &[]);
+        let mut incomplete = complete.clone();
+        incomplete.packages = crates::parse(&CargoMetadata {
             packages: metadata(&root, "1.0.0", &[]).packages,
             workspace_root: root.clone(),
             target_directory: root.join("target"),
             workspace_members: vec!["core".to_string(), "app".to_string(), "unrelated".to_string()],
             resolve: None,
         });
-        let mut host = TestHost::new();
         let diff = GitDiff {
             changed: vec![PathBuf::from("Cargo.lock")],
             deleted: Vec::new(),
         };
 
-        let changes = classify(&mut host, &root, &CheckoutState::clean("base"), &diff, &tree, &tree).unwrap();
-
-        assert!(!changes.is_scoped(Path::new("Cargo.lock")));
-        assert!(changes.global_paths().contains(Path::new("Cargo.lock")));
-        fs::remove_dir_all(root).unwrap();
+        for (baseline, current) in [(&incomplete, &complete), (&complete, &incomplete), (&incomplete, &incomplete)] {
+            let changes = classify(&mut TestHost::new(), &root, &CheckoutState::clean("base"), &diff, baseline, current).unwrap();
+            assert!(!changes.is_scoped(Path::new("Cargo.lock")));
+            assert!(changes.global_paths().contains(Path::new("Cargo.lock")));
+        }
     }
 
     #[test]

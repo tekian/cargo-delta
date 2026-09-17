@@ -71,22 +71,11 @@ pub struct CargoResolveNode {
     pub id: String,
     #[serde(default)]
     pub deps: Vec<CargoResolveDependency>,
-    #[serde(default)]
-    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CargoResolveDependency {
-    pub name: String,
     pub pkg: String,
-    #[serde(default)]
-    pub dep_kinds: Vec<CargoDependencyKind>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct CargoDependencyKind {
-    pub kind: Option<String>,
-    pub target: Option<String>,
 }
 
 /// Get cargo metadata from current working directory
@@ -96,6 +85,10 @@ pub fn metadata(host: &mut impl Host, working_dir: Option<&Path>) -> Result<Carg
 
 pub fn snapshot_metadata(host: &mut impl Host, working_dir: Option<&Path>) -> Result<CargoMetadata> {
     let metadata = metadata(host, working_dir)?;
+    complete_snapshot_metadata(host, working_dir, metadata)
+}
+
+pub fn complete_snapshot_metadata(host: &mut impl Host, working_dir: Option<&Path>, metadata: CargoMetadata) -> Result<CargoMetadata> {
     if !metadata.workspace_root.join("Cargo.lock").is_file() {
         return Ok(metadata);
     }

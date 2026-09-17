@@ -15,32 +15,38 @@ pub struct Packages {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Package {
-    pub workspace_dependencies: Vec<PackageId>,
-    pub external_dependencies: Vec<ExternalPackageId>,
-    pub dependency_declarations: Vec<DependencyDeclaration>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ExternalPackageId {
-    pub name: String,
-    pub version: String,
-    pub source: Option<String>,
+struct Package {
+    workspace_dependencies: Vec<PackageId>,
+    external_dependencies: Vec<ExternalPackage>,
+    dependency_declarations: Vec<DependencyDeclaration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct DependencyDeclaration {
-    pub name: String,
-    pub rename: Option<String>,
-    pub requirement: String,
-    pub source: Option<String>,
-    pub path: Option<PathBuf>,
-    pub kind: Option<String>,
-    pub target: Option<String>,
-    pub optional: bool,
-    pub default_features: bool,
-    pub features: Vec<String>,
-    pub registry: Option<String>,
+struct ExternalPackage {
+    id: ExternalPackageId,
+    dependencies: Vec<ExternalPackageId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct ExternalPackageId {
+    name: String,
+    version: String,
+    source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct DependencyDeclaration {
+    name: String,
+    rename: Option<String>,
+    requirement: String,
+    source: Option<String>,
+    path: Option<PathBuf>,
+    kind: Option<String>,
+    target: Option<String>,
+    optional: bool,
+    default_features: bool,
+    features: Vec<String>,
+    registry: Option<String>,
 }
 
 pub fn package_id(name: &str, version: &str) -> PackageId {
@@ -72,7 +78,8 @@ pub fn parse(metadata: &CargoMetadata) -> Packages {
     let mut packages = HashMap::new();
     for package in workspace_packages {
         let mut workspace_dependencies = BTreeSet::new();
-        let mut external_dependencies = BTreeSet::new();
+        let mut external_dependencies: std::collections::BTreeMap<ExternalPackageId, BTreeSet<ExternalPackageId>> =
+            std::collections::BTreeMap::new();
         if let Some(node) = nodes.get(package.id.as_str()) {
             let mut pending = node.deps.iter().map(|dependency| dependency.pkg.as_str()).collect::<Vec<_>>();
             let mut visited = HashSet::new();
@@ -84,15 +91,21 @@ pub fn parse(metadata: &CargoMetadata) -> Packages {
                     let _ = workspace_dependencies.insert(workspace_id.clone());
                     continue;
                 }
-                if let Some(external) = packages_by_id.get(dependency) {
-                    let _ = external_dependencies.insert(ExternalPackageId {
-                        name: external.name.clone(),
-                        version: external.version.clone(),
-                        source: external.source.clone(),
-                    });
-                }
+                let Some(external) = packages_by_id.get(dependency) else {
+                    continue;
+                };
+                let external_package_id = external_id(external);
+                let direct_dependencies = external_dependencies.entry(external_package_id).or_default();
                 if let Some(node) = nodes.get(dependency) {
-                    pending.extend(node.deps.iter().map(|dependency| dependency.pkg.as_str()));
+                    for child in &node.deps {
+                        if workspace_ids.contains_key(child.pkg.as_str()) {
+                            continue;
+                        }
+                        if let Some(package) = packages_by_id.get(child.pkg.as_str()) {
+                            let _ = direct_dependencies.insert(external_id(package));
+                            pending.push(child.pkg.as_str());
+                        }
+                    }
                 }
             }
         } else {
@@ -115,7 +128,13 @@ pub fn parse(metadata: &CargoMetadata) -> Packages {
             id,
             Package {
                 workspace_dependencies: workspace_dependencies.into_iter().collect(),
-                external_dependencies: external_dependencies.into_iter().collect(),
+                external_dependencies: external_dependencies
+                    .into_iter()
+                    .map(|(id, dependencies)| ExternalPackage {
+                        id,
+                        dependencies: dependencies.into_iter().collect(),
+                    })
+                    .collect(),
                 dependency_declarations,
             },
         );
@@ -214,14 +233,13 @@ impl Packages {
         self.packages.keys().find(|candidate| package_name(candidate) == name).cloned()
     }
 
-    pub fn consumers_of_external(&self, dependencies: &HashSet<ExternalPackageId>) -> HashSet<PackageId> {
+    pub fn changed_external_resolution(&self, baseline: &Self) -> HashSet<PackageId> {
         self.packages
             .iter()
-            .filter(|(_id, package)| {
-                package
-                    .external_dependencies
-                    .iter()
-                    .any(|dependency| dependencies.contains(dependency))
+            .filter(|(id, current)| {
+                baseline
+                    .find_record_by_name(id)
+                    .is_none_or(|previous| previous.external_dependencies != current.external_dependencies)
             })
             .map(|(id, _package)| id.clone())
             .collect()
@@ -257,6 +275,14 @@ impl Packages {
             .iter()
             .find(|(candidate, _record)| package_name(candidate) == name)
             .map(|(_id, record)| record)
+    }
+}
+
+fn external_id(package: &cargo::CargoPackage) -> ExternalPackageId {
+    ExternalPackageId {
+        name: package.name.clone(),
+        version: package.version.clone(),
+        source: package.source.clone(),
     }
 }
 
@@ -443,18 +469,41 @@ mod tests {
         assert_eq!(
             core.external_dependencies,
             [
-                ExternalPackageId {
-                    name: "external".to_string(),
-                    version: "1.0.0".to_string(),
-                    source: Some("registry+index".to_string()),
+                ExternalPackage {
+                    id: ExternalPackageId {
+                        name: "external".to_string(),
+                        version: "1.0.0".to_string(),
+                        source: Some("registry+index".to_string()),
+                    },
+                    dependencies: vec![ExternalPackageId {
+                        name: "transitive".to_string(),
+                        version: "2.0.0".to_string(),
+                        source: Some("registry+index".to_string()),
+                    }],
                 },
-                ExternalPackageId {
-                    name: "transitive".to_string(),
-                    version: "2.0.0".to_string(),
-                    source: Some("registry+index".to_string()),
+                ExternalPackage {
+                    id: ExternalPackageId {
+                        name: "transitive".to_string(),
+                        version: "2.0.0".to_string(),
+                        source: Some("registry+index".to_string()),
+                    },
+                    dependencies: Vec::new(),
                 }
             ]
         );
+
+        let mut rewired = metadata;
+        let nodes = &mut rewired.resolve.as_mut().unwrap().nodes;
+        nodes.iter_mut().find(|node| node.id == "external").unwrap().deps.clear();
+        nodes
+            .iter_mut()
+            .find(|node| node.id == "core")
+            .unwrap()
+            .deps
+            .push(serde_json::from_value(serde_json::json!({"name": "transitive", "pkg": "transitive"})).unwrap());
+        let rewired = parse(&rewired);
+
+        assert_eq!(rewired.changed_external_resolution(&packages), HashSet::from([id("core")]));
     }
 
     #[test]
