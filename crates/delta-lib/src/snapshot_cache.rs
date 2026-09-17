@@ -425,7 +425,12 @@ mod tests {
 
         let first = invoke(&caller_workspace, &output);
         assert_eq!(first.exit_code, None, "{}", first.stderr());
-        assert_eq!(fs::read_to_string(&output_file).unwrap(), "workspace-lib@1.2.3\n");
+        assert_eq!(
+            fs::read_to_string(&output_file).unwrap(),
+            "workspace-lib@1.2.3\n",
+            "{}",
+            first.stderr()
+        );
         assert_eq!(first.worktree_adds(), 1);
         assert_eq!(first.worktree_removes(), 1);
         assert_eq!(first.metadata_calls(), 2);
