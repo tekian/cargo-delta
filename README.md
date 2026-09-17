@@ -282,10 +282,10 @@ trip_wire_patterns = [
 
 ### Snapshot
 
-`cargo delta snapshot` writes the same cache-keyed JSON artifact that managed
+`cargo delta snapshot` writes the same cache-keyed JSON artifact that cached
 impact generation stores under `target/cargo-delta/`. It describes the workspace
 at the current checkout and can be used as an explicit impact input or placed
-directly at a managed cache path.
+directly at a cache path.
 
 Snapshot generation requires the Cargo workspace to be inside a Git worktree.
 The snapshot records the resolved `HEAD` commit and uses Git-root-relative paths;
@@ -294,7 +294,8 @@ outside Git, the command exits with an error and does not write a snapshot.
 - **`files`** is the nested tree of detected inputs. Each package manifest node
   records its `name@version` package ID.
 - **`packages`** maps each workspace package ID to its direct workspace
-  dependency IDs.
+  dependencies, transitive external dependencies up to the next workspace
+  package, and effective direct dependency declarations.
 
 For example:
 
@@ -314,9 +315,18 @@ For example:
   },
   "packages": {
     "packages": {
-      "app@1.0.0": ["core@1.0.0"],
-      "core@1.0.0": []
-    }
+      "app@1.0.0": {
+        "workspace_dependencies": ["core@1.0.0"],
+        "external_dependencies": [],
+        "dependency_declarations": []
+      },
+      "core@1.0.0": {
+        "workspace_dependencies": [],
+        "external_dependencies": [],
+        "dependency_declarations": []
+      }
+    },
+    "resolution_complete": true
   }
 }
 ```
@@ -334,7 +344,7 @@ cargo delta snapshot --output target/cargo-delta/current.json
 cargo delta snapshot > target/cargo-delta/current.json
 ```
 
-The managed cache directory is always excluded from the snapshot's working-tree
+The cache directory is always excluded from the snapshot's working-tree
 digest, so both `current.json` commands produce a directly reusable cache entry.
 For other destinations, prefer `--output` so cargo-delta can create parent
 directories and exclude the output file from the digest.
@@ -361,6 +371,23 @@ Each invocation performs these steps:
    in the current workspace.
 5. Expand the modified packages through the current dependency graph to produce
    the affected and required tiers.
+
+When Git reports the workspace `Cargo.lock` changed, cargo-delta parses the
+baseline and current lockfiles and compares package identity, checksum, and
+dependency lists. Changed external package identities are mapped through each
+snapshot's `external_dependencies`. Only their nearest workspace consumers are
+modified; workspace dependents become affected through the existing graph.
+
+When Git reports the root `Cargo.toml` changed, cargo-delta compares the
+manifests semantically. Changes confined to `[workspace.dependencies]`,
+`workspace.members`, or `workspace.exclude` are mapped through effective package
+declarations and package-set changes. Any other root setting remains a
+full-workspace trip wire, including profiles, workspace lints, resolver,
+workspace package defaults, patches, and unknown settings.
+
+Full external resolution is collected with `cargo metadata --all-features
+--locked` when a lockfile exists. A workspace without a lockfile remains
+supported, but lockfile scoping is unavailable and therefore conservative.
 
 Snapshot caching avoids rebuilding file ownership and dependency information,
 but it does not cache the Git change set. Every impact invocation reruns the Git

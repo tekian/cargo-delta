@@ -612,6 +612,7 @@ mod tests {
         fs::write(&assumed_file, "message Example {}").unwrap();
         let metadata = CargoMetadata {
             packages: vec![CargoPackage {
+                id: "package".to_string(),
                 name: "package".to_string(),
                 version: "0.1.0".to_string(),
                 source: None,
@@ -621,6 +622,8 @@ mod tests {
             }],
             workspace_root: root.clone(),
             target_directory: root.join("target"),
+            workspace_members: vec!["package".to_string()],
+            resolve: None,
         };
         let config = MainConfig {
             parser: ParserConfig {

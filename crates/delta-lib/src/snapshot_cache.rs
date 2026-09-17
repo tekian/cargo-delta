@@ -31,7 +31,14 @@ impl<'a, H: Host> SnapshotCache<'a, H> {
             let _ = writeln!(self.host.error(), "Using cached current snapshot: {}", path.display());
             return Ok(snapshot);
         }
-        let snapshot = Snapshot::build(self.host, &self.context, state)?;
+        let metadata = cargo::snapshot_metadata(self.host, Some(&self.context.metadata.workspace_root))
+            .map_err(|error| Error::Other(format!("Failed to read resolved current Cargo metadata: {error}")))?;
+        let context = SnapshotContext {
+            config: self.context.config,
+            metadata: &metadata,
+            git_root: self.context.git_root,
+        };
+        let snapshot = Snapshot::build(self.host, &context, state)?;
         write_cache(&path, &snapshot)?;
         Ok(snapshot)
     }
@@ -48,8 +55,8 @@ impl<'a, H: Host> SnapshotCache<'a, H> {
         let mut worktree = TemporaryWorktree::create(self.host, self.context.git_root, state.head())?;
         let workspace_dir = worktree.path.join(&workspace);
         let snapshot_result = if workspace_dir.join("Cargo.toml").is_file() {
-            let metadata = cargo::metadata(self.host, Some(&workspace_dir))
-                .map_err(|error| Error::Other(format!("Failed to read baseline Cargo metadata: {error}")))?;
+            let metadata = cargo::snapshot_metadata(self.host, Some(&workspace_dir))
+                .map_err(|error| Error::Other(format!("Failed to read resolved baseline Cargo metadata: {error}")))?;
             let context = SnapshotContext {
                 config: self.context.config,
                 metadata: &metadata,
@@ -262,6 +269,21 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    fn run_cargo(root: &Path, args: &[&str]) {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+        let output = Command::new(cargo)
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("test Cargo command should start");
+        assert!(
+            output.status.success(),
+            "cargo {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn repository(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("cargo-delta-impact-snapshots-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -284,6 +306,49 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("lib/src/lib.rs"), format!("pub fn value() -> u32 {{ {value} }}\n")).unwrap();
+    }
+
+    fn write_dependency_workspace(root: &Path, external_version: &str, enable_extra: bool) {
+        fs::create_dir_all(root.join("core/src")).unwrap();
+        fs::create_dir_all(root.join("app/src")).unwrap();
+        fs::create_dir_all(root.join("unrelated/src")).unwrap();
+        fs::create_dir_all(root.join("vendor/external/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[workspace]\nmembers = [\"core\", \"app\", \"unrelated\"]\nexclude = [\"vendor/external\"]\nresolver = \"2\"\n\
+                 [workspace.dependencies]\nexternal = {{ path = \"vendor/external\", version = \"{external_version}\"{} }}\n",
+                if enable_extra { ", features = [\"extra\"]" } else { "" }
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("core/Cargo.toml"),
+            "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nexternal.workspace = true\n",
+        )
+        .unwrap();
+        fs::write(root.join("core/src/lib.rs"), "pub fn core() { external::external(); }\n").unwrap();
+        fs::write(
+            root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ncore = { path = \"../core\" }\n",
+        )
+        .unwrap();
+        fs::write(root.join("app/src/lib.rs"), "pub fn app() { core::core(); }\n").unwrap();
+        fs::write(
+            root.join("unrelated/Cargo.toml"),
+            "[package]\nname = \"unrelated\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("unrelated/src/lib.rs"), "pub fn unrelated() {}\n").unwrap();
+        fs::write(
+            root.join("vendor/external/Cargo.toml"),
+            format!(
+                "[package]\nname = \"external\"\nversion = \"{external_version}\"\nedition = \"2024\"\n\
+                 [features]\nextra = []\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("vendor/external/src/lib.rs"), "pub fn external() {}\n").unwrap();
     }
 
     fn commit(root: &Path, message: &str) {
@@ -418,6 +483,107 @@ mod tests {
         assert_eq!(host.exit_code, Some(0), "{}", host.stderr());
         assert_eq!(fs::metadata(output).unwrap().len(), 0);
         assert!(host.stderr().contains("No file has been changed or deleted"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn lock_and_workspace_dependency_changes_are_scoped_to_consumers() {
+        let root = repository("dependency-inputs");
+        fs::write(root.join(".delta.toml"), "trip_wire_patterns = [\"Cargo.lock\", \"Cargo.toml\"]\n").unwrap();
+        write_dependency_workspace(&root, "1.0.0", false);
+        run_cargo(&root, &["generate-lockfile"]);
+        commit(&root, "baseline");
+        git(&root, &["tag", "baseline"]);
+        write_dependency_workspace(&root, "2.0.0", false);
+        run_cargo(&root, &["generate-lockfile"]);
+        commit(&root, "update external dependency");
+
+        let modified_output = root.join("target/modified.packages");
+        let affected_output = root.join("target/affected.packages");
+        let mut modified = ProcessHost::new(root.clone());
+        crate::run(
+            &mut modified,
+            [
+                "cargo".to_string(),
+                "delta".to_string(),
+                "-c".to_string(),
+                root.join(".delta.toml").display().to_string(),
+                "impact".to_string(),
+                "--base-ref".to_string(),
+                "baseline".to_string(),
+                "--modified".to_string(),
+                "--format".to_string(),
+                "packages".to_string(),
+                "--output".to_string(),
+                modified_output.display().to_string(),
+            ],
+        );
+        let mut affected = ProcessHost::new(root.clone());
+        crate::run(
+            &mut affected,
+            [
+                "cargo".to_string(),
+                "delta".to_string(),
+                "-c".to_string(),
+                root.join(".delta.toml").display().to_string(),
+                "impact".to_string(),
+                "--base-ref".to_string(),
+                "baseline".to_string(),
+                "--affected".to_string(),
+                "--format".to_string(),
+                "packages".to_string(),
+                "--output".to_string(),
+                affected_output.display().to_string(),
+            ],
+        );
+
+        assert_eq!(modified.exit_code, None, "{}", modified.stderr());
+        assert_eq!(affected.exit_code, None, "{}", affected.stderr());
+        assert_eq!(fs::read_to_string(modified_output).unwrap(), "core@0.1.0\n");
+        assert_eq!(fs::read_to_string(affected_output).unwrap(), "app@0.1.0\ncore@0.1.0\n");
+        assert!(!modified.stderr().contains("Trip wire activated"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn workspace_dependency_feature_change_is_scoped_with_unchanged_lockfile() {
+        let root = repository("dependency-features");
+        fs::write(root.join(".delta.toml"), "trip_wire_patterns = [\"Cargo.toml\"]\n").unwrap();
+        write_dependency_workspace(&root, "1.0.0", false);
+        run_cargo(&root, &["generate-lockfile"]);
+        let baseline_lock = fs::read(root.join("Cargo.lock")).unwrap();
+        commit(&root, "baseline");
+        git(&root, &["tag", "baseline"]);
+        write_dependency_workspace(&root, "1.0.0", true);
+        run_cargo(&root, &["generate-lockfile"]);
+        assert_eq!(fs::read(root.join("Cargo.lock")).unwrap(), baseline_lock);
+        commit(&root, "enable external feature");
+        let output = root.join("target/modified.packages");
+        let mut host = ProcessHost::new(root.clone());
+
+        crate::run(
+            &mut host,
+            [
+                "cargo".to_string(),
+                "delta".to_string(),
+                "-c".to_string(),
+                root.join(".delta.toml").display().to_string(),
+                "impact".to_string(),
+                "--base-ref".to_string(),
+                "baseline".to_string(),
+                "--modified".to_string(),
+                "--format".to_string(),
+                "packages".to_string(),
+                "--output".to_string(),
+                output.display().to_string(),
+            ],
+        );
+
+        assert_eq!(host.exit_code, None, "{}", host.stderr());
+        assert_eq!(fs::read_to_string(output).unwrap(), "core@0.1.0\n");
+        assert!(!host.stderr().contains("Trip wire activated"));
         fs::remove_dir_all(root).unwrap();
     }
 
