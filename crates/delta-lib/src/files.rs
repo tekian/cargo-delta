@@ -81,13 +81,18 @@ impl FileNode {
     }
 
     pub fn make_relative_paths(&mut self, workspace_root: &Path) {
-        self.path = match self.path.strip_prefix(workspace_root) {
-            Ok(relative) => relative.to_path_buf(),
-            Err(_) => self.path.clone(),
-        };
+        let workspace_root = fs::canonicalize(workspace_root).unwrap_or_else(|_error| workspace_root.to_path_buf());
+        self.make_relative_paths_from(&workspace_root);
+    }
+
+    fn make_relative_paths_from(&mut self, workspace_root: &Path) {
+        let path = fs::canonicalize(&self.path).unwrap_or_else(|_error| self.path.clone());
+        self.path = path
+            .strip_prefix(workspace_root)
+            .map_or_else(|_error| path.clone(), Path::to_path_buf);
 
         for child in &mut self.children {
-            child.make_relative_paths(workspace_root);
+            child.make_relative_paths_from(workspace_root);
         }
     }
 
@@ -583,6 +588,20 @@ mod tests {
     }
 
     #[test]
+    fn make_relative_paths_resolves_equivalent_filesystem_paths() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-relative-paths-{}", std::process::id()));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("file.rs"), "").unwrap();
+        let mut node = FileNode::new(nested.join("../file.rs"), FileKind::Module);
+
+        node.make_relative_paths(&root);
+
+        assert_eq!(node.path, PathBuf::from("file.rs"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn find_packages_containing_file_finds_match() {
         let mut root = FileNode::new(PathBuf::from("Cargo.toml"), FileKind::Workspace);
         let package = package_id("package-name", "0.1.0");
@@ -612,6 +631,7 @@ mod tests {
         fs::write(&assumed_file, "message Example {}").unwrap();
         let metadata = CargoMetadata {
             packages: vec![CargoPackage {
+                id: "package".to_string(),
                 name: "package".to_string(),
                 version: "0.1.0".to_string(),
                 source: None,
@@ -621,6 +641,8 @@ mod tests {
             }],
             workspace_root: root.clone(),
             target_directory: root.join("target"),
+            workspace_members: vec!["package".to_string()],
+            resolve: None,
         };
         let config = MainConfig {
             parser: ParserConfig {

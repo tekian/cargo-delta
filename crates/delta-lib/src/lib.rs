@@ -20,6 +20,7 @@ use crate::snapshot::{Snapshot, SnapshotContext};
 use crate::snapshot_cache::SnapshotCache;
 
 mod cargo;
+mod cargo_inputs;
 mod config;
 mod crates;
 mod error;
@@ -222,7 +223,7 @@ fn select_snapshots(
     host: &mut impl Host,
     config: &config::LoadedConfig,
     command: &ImpactCommand,
-) -> error::Result<(Snapshot, Snapshot, git::GitComparison)> {
+) -> error::Result<(Snapshot, Snapshot, git::GitComparison, PathBuf)> {
     let caller_dir = host
         .current_dir()
         .map_err(|error| error::Error::Other(format!("Failed to get current directory: {error}")))?;
@@ -274,7 +275,7 @@ fn select_snapshots(
         }
         None => SnapshotCache::new(host, context).baseline(&comparison.base)?,
     };
-    Ok((baseline, current, comparison))
+    Ok((baseline, current, comparison, git_root))
 }
 
 #[doc(hidden)]
@@ -284,7 +285,7 @@ fn impact(host: &mut impl Host, config: &config::LoadedConfig, command: &ImpactC
     let tiers = TierMask::resolve(command.modified, command.affected, command.required);
 
     let _ = writeln!(host.error(), "Looking up git changes..");
-    let (baseline_tree, current_tree, comparison) = match select_snapshots(host, config, command) {
+    let (baseline_tree, current_tree, comparison, git_root) = match select_snapshots(host, config, command) {
         Ok(inputs) => inputs,
         Err(error) => {
             let _ = writeln!(host.error(), "Error resolving impact inputs: {error}");
@@ -294,6 +295,18 @@ fn impact(host: &mut impl Host, config: &config::LoadedConfig, command: &ImpactC
     };
     let widen = !baseline_tree.workspace_present();
     let diff = comparison.diff;
+    let cargo_changes = if widen {
+        cargo_inputs::CargoInputChanges::default()
+    } else {
+        match cargo_inputs::classify(host, &git_root, &comparison.base, &diff, &baseline_tree, &current_tree) {
+            Ok(changes) => changes,
+            Err(error) => {
+                let _ = writeln!(host.error(), "Error classifying Cargo input changes: {error}");
+                host.exit(1);
+                return;
+            }
+        }
+    };
 
     if diff.changed.is_empty() && diff.deleted.is_empty() && !widen {
         let _ = writeln!(host.error(), "No file has been changed or deleted, quitting.");
@@ -320,7 +333,7 @@ fn impact(host: &mut impl Host, config: &config::LoadedConfig, command: &ImpactC
             required: packages,
         }
     } else {
-        get_impacted_packages(host, &baseline_tree, &current_tree, &diff, &config.value)
+        get_impacted_packages(host, &baseline_tree, &current_tree, &diff, &cargo_changes, &config.value)
     };
 
     if !emit_result(
@@ -480,10 +493,24 @@ fn get_impacted_packages(
     baseline_tree: &Snapshot,
     current_tree: &Snapshot,
     git_diff: &GitDiff,
+    cargo_changes: &cargo_inputs::CargoInputChanges,
     config: &MainConfig,
 ) -> Impact {
-    let mut modified = HashSet::new();
-    let mut affected_seeds = HashSet::new();
+    let mut modified = cargo_changes.modified.clone();
+    let mut affected_seeds = cargo_changes.affected.clone();
+
+    if !cargo_changes.global_paths().is_empty() {
+        let _ = writeln!(host.error(), "Cargo input changes require a full workspace build due to:");
+        for path in cargo_changes.global_paths() {
+            let _ = writeln!(host.error(), "- {}", path.display());
+        }
+        let packages: HashSet<PackageId> = current_tree.packages.get_all_package_ids().into_iter().collect();
+        return Impact {
+            modified: packages.clone(),
+            affected: packages.clone(),
+            required: packages,
+        };
+    }
 
     if !config.trip_wire_patterns.is_empty() {
         use glob::Pattern;
@@ -497,16 +524,16 @@ fn get_impacted_packages(
         let mut tripped_files = Vec::new();
 
         for deleted_file in &git_diff.deleted {
-            let file_str = deleted_file.to_string_lossy();
-            if trip_wire_patterns.iter().any(|pattern| pattern.matches(&file_str)) {
-                tripped_files.push(file_str.to_string());
+            if !cargo_changes.is_scoped(deleted_file) && trip_wire_patterns.iter().any(|pattern| utils::path_matches(pattern, deleted_file))
+            {
+                tripped_files.push(deleted_file.display().to_string());
             }
         }
 
         for changed_file in &git_diff.changed {
-            let file_str = changed_file.to_string_lossy();
-            if trip_wire_patterns.iter().any(|pattern| pattern.matches(&file_str)) {
-                tripped_files.push(file_str.to_string());
+            if !cargo_changes.is_scoped(changed_file) && trip_wire_patterns.iter().any(|pattern| utils::path_matches(pattern, changed_file))
+            {
+                tripped_files.push(changed_file.display().to_string());
             }
         }
 
@@ -529,7 +556,10 @@ fn get_impacted_packages(
             };
         }
 
-        let _ = writeln!(host.error(), "Trip wire is enabled, but no matching files were found, good.");
+        let _ = writeln!(
+            host.error(),
+            "Trip wire is enabled, but no unscoped matching files were found, good."
+        );
         let _ = writeln!(host.error());
     }
 
@@ -553,17 +583,6 @@ fn get_impacted_packages(
 
     for changed_file in &git_diff.changed {
         let packages_for_file = current_tree.files.find_packages_containing_file(changed_file);
-
-        for package in packages_for_file {
-            let _ = modified.insert(package);
-        }
-    }
-
-    let main_files = baseline_tree.files.distinct();
-    let branch_files = current_tree.files.distinct();
-
-    for new_file in branch_files.difference(&main_files) {
-        let packages_for_file = current_tree.files.find_packages_containing_file(new_file);
 
         for package in packages_for_file {
             let _ = modified.insert(package);
@@ -618,6 +637,7 @@ mod tests {
         let mut packages = Vec::new();
         for (name, deps) in package_deps {
             packages.push(CargoPackage {
+                id: name.to_string(),
                 name: name.to_string(),
                 version: "0.1.0".to_string(),
                 source: None,
@@ -632,6 +652,7 @@ mod tests {
                     .map(|d| CargoDependency {
                         name: d.to_string(),
                         source: None,
+                        ..CargoDependency::default()
                     })
                     .collect(),
             });
@@ -640,6 +661,8 @@ mod tests {
             packages,
             workspace_root: PathBuf::from("/workspace"),
             target_directory: PathBuf::from("/workspace/target"),
+            workspace_members: package_deps.iter().map(|(name, _deps)| (*name).to_string()).collect(),
+            resolve: None,
         }
     }
 
@@ -689,7 +712,7 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config);
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &cargo_inputs::CargoInputChanges::default(), &config);
 
         assert!(result.modified.is_empty());
         assert!(result.affected.is_empty());
@@ -706,7 +729,7 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config);
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &cargo_inputs::CargoInputChanges::default(), &config);
 
         assert!(result.modified.contains(&id("lib")));
         assert!(!result.modified.contains(&id("app")));
@@ -722,7 +745,7 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config);
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &cargo_inputs::CargoInputChanges::default(), &config);
 
         assert!(result.modified.contains(&id("lib")));
         assert!(result.affected.contains(&id("lib")));
@@ -744,7 +767,7 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config);
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &cargo_inputs::CargoInputChanges::default(), &config);
 
         assert!(result.modified.contains(&id("middleware")));
         assert!(result.affected.contains(&id("app")));
@@ -765,23 +788,37 @@ mod tests {
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_packages(&mut host, &baseline, &current, &diff, &config);
+        let result = get_impacted_packages(
+            &mut host,
+            &baseline,
+            &current,
+            &diff,
+            &cargo_inputs::CargoInputChanges::default(),
+            &config,
+        );
 
         assert!(result.modified.contains(&id("lib")));
     }
 
     #[test]
-    fn new_file_in_branch_marks_package_modified() {
+    fn added_file_marks_package_modified() {
         let mut host = TestHost::new();
         let baseline = make_workspace(&[("lib", &["lib/src/lib.rs"], &[])]);
         let current = make_workspace(&[("lib", &["lib/src/lib.rs", "lib/src/new.rs"], &[])]);
         let diff = GitDiff {
-            changed: vec![],
+            changed: vec![PathBuf::from("lib/src/new.rs")],
             deleted: vec![],
         };
         let config = MainConfig::default();
 
-        let result = get_impacted_packages(&mut host, &baseline, &current, &diff, &config);
+        let result = get_impacted_packages(
+            &mut host,
+            &baseline,
+            &current,
+            &diff,
+            &cargo_inputs::CargoInputChanges::default(),
+            &config,
+        );
 
         assert!(result.modified.contains(&id("lib")));
     }
@@ -799,7 +836,7 @@ mod tests {
             ..MainConfig::default()
         };
 
-        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config);
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &cargo_inputs::CargoInputChanges::default(), &config);
 
         assert!(result.modified.contains(&id("app")));
         assert!(result.modified.contains(&id("lib")));
@@ -821,10 +858,10 @@ mod tests {
             ..MainConfig::default()
         };
 
-        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config);
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &cargo_inputs::CargoInputChanges::default(), &config);
 
         assert!(result.modified.contains(&id("lib")));
-        assert!(host.stderr_str().contains("no matching files were found"));
+        assert!(host.stderr_str().contains("no unscoped matching files were found"));
     }
 
     #[test]
@@ -840,10 +877,104 @@ mod tests {
             ..MainConfig::default()
         };
 
-        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &config);
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &cargo_inputs::CargoInputChanges::default(), &config);
 
         assert!(result.modified.contains(&id("app")));
         assert!(host.stderr_str().contains("Trip wire activated"));
+    }
+
+    #[test]
+    fn semantically_scoped_cargo_lock_bypasses_trip_wire() {
+        let mut host = TestHost::new();
+        let tree = make_workspace(&[
+            ("app", &["app/src/main.rs"], &["core"]),
+            ("core", &["core/src/lib.rs"], &[]),
+            ("unrelated", &["unrelated/src/lib.rs"], &[]),
+        ]);
+        let diff = GitDiff {
+            changed: vec![PathBuf::from("Cargo.lock")],
+            deleted: Vec::new(),
+        };
+        let changes = cargo_inputs::CargoInputChanges {
+            modified: HashSet::from([id("core")]),
+            affected: HashSet::new(),
+            scoped_paths: HashSet::from([PathBuf::from("Cargo.lock")]),
+            ..cargo_inputs::CargoInputChanges::default()
+        };
+        let config = MainConfig {
+            trip_wire_patterns: vec!["Cargo.lock".to_string()],
+            ..MainConfig::default()
+        };
+
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &changes, &config);
+
+        assert_eq!(result.modified, HashSet::from([id("core")]));
+        assert!(result.affected.contains(&id("app")));
+        assert!(!result.affected.contains(&id("unrelated")));
+        assert!(!host.stderr_str().contains("Trip wire activated"));
+    }
+
+    #[test]
+    fn global_cargo_input_selects_workspace_without_configured_trip_wire() {
+        let mut host = TestHost::new();
+        let tree = make_workspace(&[("app", &["app/src/main.rs"], &[]), ("lib", &["lib/src/lib.rs"], &[])]);
+        let changes = cargo_inputs::CargoInputChanges {
+            global_paths: std::collections::BTreeSet::from([PathBuf::from("Cargo.toml")]),
+            ..cargo_inputs::CargoInputChanges::default()
+        };
+
+        let result = get_impacted_packages(
+            &mut host,
+            &tree,
+            &tree,
+            &GitDiff {
+                changed: vec![PathBuf::from("Cargo.toml")],
+                deleted: Vec::new(),
+            },
+            &changes,
+            &MainConfig::default(),
+        );
+
+        assert_eq!(result.modified, HashSet::from([id("app"), id("lib")]));
+        assert!(host.stderr_str().contains("Cargo input changes require a full workspace build"));
+    }
+
+    #[test]
+    fn root_trip_wire_glob_does_not_match_nested_path() {
+        let mut host = TestHost::new();
+        let tree = make_workspace(&[("app", &["app/src/main.rs"], &[])]);
+        let diff = GitDiff {
+            changed: vec![PathBuf::from("templates/build.just")],
+            deleted: Vec::new(),
+        };
+        let config = MainConfig {
+            trip_wire_patterns: vec!["*.just".to_string()],
+            ..MainConfig::default()
+        };
+
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &cargo_inputs::CargoInputChanges::default(), &config);
+
+        assert!(result.modified.is_empty());
+        assert!(!host.stderr_str().contains("Trip wire activated"));
+    }
+
+    #[test]
+    fn deleted_nonmatching_file_does_not_activate_trip_wire() {
+        let mut host = TestHost::new();
+        let tree = make_workspace(&[("app", &["app/src/main.rs"], &[])]);
+        let diff = GitDiff {
+            changed: Vec::new(),
+            deleted: vec![PathBuf::from("README.md")],
+        };
+        let config = MainConfig {
+            trip_wire_patterns: vec!["Cargo.lock".to_string()],
+            ..MainConfig::default()
+        };
+
+        let result = get_impacted_packages(&mut host, &tree, &tree, &diff, &cargo_inputs::CargoInputChanges::default(), &config);
+
+        assert!(result.modified.is_empty());
+        assert!(!host.stderr_str().contains("Trip wire activated"));
     }
 
     // --- emit_result / TierMask tests ---
@@ -1150,7 +1281,14 @@ mod tests {
         .unwrap();
 
         assert!(snapshot.get("crates").is_none());
-        assert_eq!(snapshot["packages"]["packages"]["app@0.1.0"], serde_json::json!(["lib@0.1.0"]));
+        assert_eq!(
+            snapshot["packages"]["packages"]["app@0.1.0"]["workspace_dependencies"],
+            serde_json::json!(["lib@0.1.0"])
+        );
+        assert_eq!(
+            snapshot["packages"]["packages"]["app@0.1.0"]["external_dependencies"],
+            serde_json::json!([])
+        );
         assert_eq!(snapshot["files"]["children"][0]["package"], "app@0.1.0");
     }
 
@@ -1239,6 +1377,7 @@ mod tests {
             packages: Vec::new(),
             workspace_root: root.clone(),
             target_directory: root.join("target"),
+            ..CargoMetadata::default()
         };
         let mut host = TestHost::new()
             .with_commands(vec![
@@ -1277,6 +1416,7 @@ mod tests {
             packages: Vec::new(),
             workspace_root: root.clone(),
             target_directory: root.join("target"),
+            ..CargoMetadata::default()
         };
         let mut host = TestHost::new().with_commands(vec![
             Ok(success_output(&serde_json::to_string(&metadata).unwrap())),
@@ -1314,6 +1454,7 @@ mod tests {
             packages: Vec::new(),
             workspace_root: tmp.clone(),
             target_directory: tmp.join("target"),
+            ..CargoMetadata::default()
         };
         let mut host = TestHost::new().with_commands(vec![
             Ok(success_output(&format!("{}\n", tmp.display()))), // git rev-parse
@@ -1357,6 +1498,7 @@ mod tests {
             packages: Vec::new(),
             workspace_root: tmp.clone(),
             target_directory: tmp.join("target"),
+            ..CargoMetadata::default()
         };
         let mut host = TestHost::new().with_commands(vec![
             Ok(success_output(&format!("{}\n", tmp.display()))),
@@ -1405,6 +1547,7 @@ mod tests {
             packages: Vec::new(),
             workspace_root: tmp.clone(),
             target_directory: tmp.join("target"),
+            ..CargoMetadata::default()
         };
         let mut host = TestHost::new().with_commands(vec![
             Ok(success_output(&format!("{}\n", tmp.display()))), // git rev-parse
@@ -1456,6 +1599,7 @@ mod tests {
             packages: Vec::new(),
             workspace_root: root.clone(),
             target_directory: root.join("target"),
+            ..CargoMetadata::default()
         };
         let mut host = TestHost::new()
             .with_commands(vec![

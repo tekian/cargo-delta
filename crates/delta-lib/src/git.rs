@@ -168,6 +168,36 @@ pub fn checkout_state(host: &mut impl Host, git_root: &Path, excluded_paths: &[P
     inspect_checkout(host, git_root, excluded_paths).map(|(state, _untracked)| state)
 }
 
+pub fn file_at(host: &mut impl Host, git_root: &Path, commit: &str, path: &Path) -> Result<Option<Vec<u8>>> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::Git(format!("Git path '{}' is not UTF-8", path.display())))?
+        .replace('\\', "/");
+    let listing = host
+        .run_command("git", &["ls-tree", "--name-only", "-z", commit, "--", &path], Some(git_root))
+        .map_err(|error| Error::Git(format!("Failed to inspect baseline path '{path}': {error}")))?;
+    if !listing.status.success() {
+        return Err(Error::Git(format!(
+            "git ls-tree failed for '{path}': {}",
+            String::from_utf8_lossy(&listing.stderr)
+        )));
+    }
+    if listing.stdout.is_empty() {
+        return Ok(None);
+    }
+    let object = format!("{commit}:{path}");
+    let contents = host
+        .run_command("git", &["show", &object], Some(git_root))
+        .map_err(|error| Error::Git(format!("Failed to read baseline path '{path}': {error}")))?;
+    if !contents.status.success() {
+        return Err(Error::Git(format!(
+            "git show failed for '{path}': {}",
+            String::from_utf8_lossy(&contents.stderr)
+        )));
+    }
+    Ok(Some(contents.stdout))
+}
+
 fn inspect_checkout(host: &mut impl Host, git_root: &Path, excluded_paths: &[PathBuf]) -> Result<(CheckoutState, Vec<PathBuf>)> {
     let head = git_stdout(host, git_root, &["rev-parse", "--verify", "HEAD^{commit}"], "resolve HEAD")?;
     let excluded = excluded_pathspecs(git_root, excluded_paths);
@@ -381,6 +411,32 @@ mod tests {
         let result = get_top_level(&mut host, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("git not found"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn file_at_reads_existing_path() {
+        let mut host = TestHost::new().with_commands(vec![Ok(success_output("Cargo.toml\0")), Ok(success_output("manifest"))]);
+
+        let contents = file_at(&mut host, Path::new("/repo"), "base", Path::new("Cargo.toml")).unwrap();
+
+        assert_eq!(contents, Some(b"manifest".to_vec()));
+        assert_eq!(
+            host.command_calls[0].1,
+            ["ls-tree", "--name-only", "-z", "base", "--", "Cargo.toml"]
+        );
+        assert_eq!(host.command_calls[1].1, ["show", "base:Cargo.toml"]);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn file_at_returns_none_for_missing_path() {
+        let mut host = TestHost::new().with_commands(vec![Ok(success_output(""))]);
+
+        let contents = file_at(&mut host, Path::new("/repo"), "base", Path::new("Cargo.toml")).unwrap();
+
+        assert!(contents.is_none());
+        assert_eq!(host.command_calls.len(), 1);
     }
 
     #[test]
