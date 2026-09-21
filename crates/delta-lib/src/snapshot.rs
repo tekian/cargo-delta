@@ -111,6 +111,10 @@ impl Snapshot {
         self.key().workspace_present
     }
 
+    pub fn workspace(&self) -> &Path {
+        &self.key().workspace
+    }
+
     const fn key(&self) -> &SnapshotKey {
         self.cache_key
             .as_ref()
@@ -174,7 +178,7 @@ pub fn run(host: &mut impl Host, config: &LoadedConfig, config_path: Option<&Pat
             return;
         }
     };
-    let metadata = match cargo::metadata(host, Some(&caller_dir)) {
+    let metadata = match cargo::snapshot_metadata(host, Some(&caller_dir)) {
         Ok(metadata) => metadata,
         Err(error) => {
             let _ = writeln!(host.error(), "Error getting cargo metadata: {error}");
@@ -281,6 +285,7 @@ mod tests {
             packages: Vec::new(),
             workspace_root: nested.join(".."),
             target_directory: root.join("target"),
+            ..CargoMetadata::default()
         };
         let config = load_config(None).unwrap();
         let context = SnapshotContext {
@@ -301,6 +306,7 @@ mod tests {
             packages: Vec::new(),
             workspace_root: root.clone(),
             target_directory: root.join("target"),
+            ..CargoMetadata::default()
         };
         let config = load_config(None).unwrap();
         let context = SnapshotContext {

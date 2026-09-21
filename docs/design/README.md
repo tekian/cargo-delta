@@ -16,7 +16,10 @@ cargo delta snapshot [--output PATH]
 The snapshot keeps the original two-part structure:
 
 - `files` is the detected input tree;
-- `packages` maps each workspace package to its direct workspace dependencies.
+- `packages` maps each workspace package to a record containing:
+  - direct workspace dependencies;
+  - transitive external dependencies, stopping at another workspace package;
+  - canonical effective direct dependency declarations.
 
 Snapshot generation requires a Git worktree. Git supplies the root for portable
 relative paths and the checkout identity embedded in the snapshot key; without
@@ -42,9 +45,18 @@ directory name.
   },
   "packages": {
     "packages": {
-      "app@1.0.0": ["core@1.0.0"],
-      "core@1.0.0": []
-    }
+      "app@1.0.0": {
+        "workspace_dependencies": ["core@1.0.0"],
+        "external_dependencies": [],
+        "dependency_declarations": []
+      },
+      "core@1.0.0": {
+        "workspace_dependencies": [],
+        "external_dependencies": [],
+        "dependency_declarations": []
+      }
+    },
+    "resolution_complete": true
   }
 }
 ```
@@ -82,6 +94,40 @@ cannot reconstruct those changes for a Git comparison.
 The baseline snapshot owns deleted-file lookups. The current snapshot owns
 changed and newly discovered files and supplies the dependency graph used for
 affected and required traversal.
+
+### Cargo input changes
+
+Git remains the only change detector. Cargo-specific processing runs only when
+the Git change set contains the workspace `Cargo.lock` or root `Cargo.toml`.
+
+For a changed lockfile, cargo-delta compares each matching workspace package's
+baseline and current external resolution graph. An external record contains its
+name, version, source, and direct resolved external dependencies. Packages
+whose graph differs become modified. Cargo-delta does not parse `Cargo.lock`;
+formatting, unused entries, and checksum-only edits do not change package-build
+scope when Cargo reports the same resolution.
+
+External traversal stops when it reaches another workspace package. If
+`app -> core -> external`, `core` records the external graph while `app`
+records only its workspace edge to `core`; an external change therefore makes
+`core` modified and `app` affected. Direct edges are retained so rewiring
+between the same set of external package identities is still observable.
+
+For a changed root manifest, cargo-delta parses both TOML documents and removes
+only `workspace.dependencies`, `workspace.members`, and `workspace.exclude`
+before comparing the remaining values. If anything remains changed, the root
+manifest keeps its full-workspace trip-wire behavior. Otherwise effective
+dependency declarations and package membership are compared to seed modified
+packages and surviving dependents of removed packages.
+
+Snapshot construction first uses no-deps metadata. When `Cargo.lock` already
+exists it additionally runs `cargo metadata --all-features --locked` to build
+the resolved external graph without modifying the lockfile. Without a lockfile,
+the snapshot remains usable but records incomplete resolution, so a later
+lockfile change cannot bypass its conservative trip wire.
+
+Trip-wire patterns use path-component matching. A pattern such as `*.just`
+matches only the repository root; matching nested paths requires `**`.
 
 ## Snapshot cache
 

@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::host::Host;
 use encoding_rs::Encoding;
-use glob::Pattern;
+use glob::{MatchOptions, Pattern};
 use normpath::PathExt;
 use serde::de::DeserializeOwned;
 use std::fs;
@@ -87,6 +87,17 @@ pub struct UnrelatedFiles {
     pub filtered: Vec<PathBuf>,
 }
 
+pub fn path_matches(pattern: &Pattern, path: &Path) -> bool {
+    pattern.matches_path_with(
+        path,
+        MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        },
+    )
+}
+
 pub fn find_unrelated(git_root: &Path, excludes: &[PathBuf], exclude_patterns: &[String], trip_wire_patterns: &[String]) -> UnrelatedFiles {
     fn visit(
         dir: &Path,
@@ -148,8 +159,7 @@ pub fn find_unrelated(git_root: &Path, excludes: &[PathBuf], exclude_patterns: &
                 continue;
             }
 
-            let file_str = relative_path.to_string_lossy();
-            if compiled_trip_wires.iter().any(|pattern| pattern.matches(&file_str)) {
+            if compiled_trip_wires.iter().any(|pattern| path_matches(pattern, &relative_path)) {
                 result.trip_wire.push(relative_path);
             } else {
                 result.unaccounted.push(relative_path);
@@ -205,6 +215,17 @@ mod tests {
         let result = resolve_includes(&mut host, &base, &["host.rs".to_string()]);
         assert_eq!(result.len(), 1);
         assert!(host.stderr_str().is_empty());
+    }
+
+    #[test]
+    fn path_patterns_do_not_cross_component_boundaries_without_double_star() {
+        let root_just = Pattern::new("*.just").unwrap();
+        let justfiles = Pattern::new("justfiles/**").unwrap();
+
+        assert!(path_matches(&root_just, Path::new("build.just")));
+        assert!(!path_matches(&root_just, Path::new("templates/build.just")));
+        assert!(path_matches(&justfiles, Path::new("justfiles/anvil/build.just")));
+        assert!(!path_matches(&justfiles, Path::new("nested/justfiles/anvil/build.just")));
     }
 
     #[test]

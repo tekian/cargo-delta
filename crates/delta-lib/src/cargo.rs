@@ -2,19 +2,26 @@ use crate::error::{Error, Result};
 use crate::host::Host;
 use normpath::PathExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CargoMetadata {
     pub packages: Vec<CargoPackage>,
     pub workspace_root: PathBuf,
     pub target_directory: PathBuf,
+    #[serde(default)]
+    pub workspace_members: Vec<String>,
+    #[serde(default)]
+    pub resolve: Option<CargoResolve>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CargoPackage {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub version: String,
     pub source: Option<String>,
@@ -23,26 +30,81 @@ pub struct CargoPackage {
     pub dependencies: Vec<CargoDependency>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CargoTarget {
     pub name: String,
     pub kind: Vec<String>,
     pub src_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CargoDependency {
     pub name: String,
     pub source: Option<String>,
+    #[serde(default)]
+    pub req: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub rename: Option<String>,
+    #[serde(default)]
+    pub optional: bool,
+    #[serde(default)]
+    pub uses_default_features: bool,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub registry: Option<String>,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CargoResolve {
+    pub nodes: Vec<CargoResolveNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CargoResolveNode {
+    pub id: String,
+    #[serde(default)]
+    pub deps: Vec<CargoResolveDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CargoResolveDependency {
+    pub pkg: String,
 }
 
 /// Get cargo metadata from current working directory
 pub fn metadata(host: &mut impl Host, working_dir: Option<&Path>) -> Result<CargoMetadata> {
+    metadata_with_args(host, working_dir, &["metadata", "--format-version", "1", "--no-deps"])
+}
+
+pub fn snapshot_metadata(host: &mut impl Host, working_dir: Option<&Path>) -> Result<CargoMetadata> {
+    let metadata = metadata(host, working_dir)?;
+    complete_snapshot_metadata(host, working_dir, metadata)
+}
+
+pub fn complete_snapshot_metadata(host: &mut impl Host, working_dir: Option<&Path>, metadata: CargoMetadata) -> Result<CargoMetadata> {
+    if !metadata.workspace_root.join("Cargo.lock").is_file() {
+        return Ok(metadata);
+    }
+    metadata_with_args(
+        host,
+        working_dir,
+        &["metadata", "--format-version", "1", "--all-features", "--locked"],
+    )
+}
+
+fn metadata_with_args(host: &mut impl Host, working_dir: Option<&Path>, args: &[&str]) -> Result<CargoMetadata> {
     let cargo = host
         .env_var_os("CARGO")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| OsStr::new("cargo").to_os_string());
-    let output = host.run_command(&cargo, &["metadata", "--format-version", "1", "--no-deps"], working_dir)?;
+    let output = host.run_command(&cargo, args, working_dir)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -63,7 +125,15 @@ pub fn metadata(host: &mut impl Host, working_dir: Option<&Path>) -> Result<Carg
 }
 
 pub fn get_workspace_packages(metadata: &CargoMetadata) -> Vec<&CargoPackage> {
-    metadata.packages.iter().filter(|pkg| pkg.source.is_none()).collect()
+    if metadata.workspace_members.is_empty() {
+        return metadata.packages.iter().filter(|package| package.source.is_none()).collect();
+    }
+    let members: HashSet<&str> = metadata.workspace_members.iter().map(String::as_str).collect();
+    metadata
+        .packages
+        .iter()
+        .filter(|package| members.contains(package.id.as_str()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -76,6 +146,7 @@ mod tests {
     fn metadata_parses_valid_output() {
         let json = serde_json::json!({
             "packages": [{
+                "id": "path+file:///workspace#my-crate@0.1.0",
                 "name": "my-crate",
                 "version": "0.1.0",
                 "source": null,
@@ -84,7 +155,9 @@ mod tests {
                 "dependencies": []
             }],
             "workspace_root": ".",
-            "target_directory": "target"
+            "target_directory": "target",
+            "workspace_members": ["path+file:///workspace#my-crate@0.1.0"],
+            "resolve": null
         });
 
         let mut host = TestHost::new().with_commands(vec![Ok(success_output(&json.to_string()))]);
@@ -112,6 +185,30 @@ mod tests {
 
         assert_eq!(host.command_calls[0].0, cargo);
         assert_eq!(host.command_calls[0].2.as_deref(), Some(Path::new("workspace")));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn snapshot_metadata_requests_all_features_for_locked_workspace() {
+        let root = std::env::temp_dir().join(format!("cargo-delta-resolved-metadata-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.lock"), "version = 4\n").unwrap();
+        let json = serde_json::json!({
+            "packages": [],
+            "workspace_root": root,
+            "target_directory": root.join("target"),
+            "workspace_members": [],
+            "resolve": {"nodes": []}
+        });
+        let mut host = TestHost::new().with_commands(vec![Ok(success_output(&json.to_string())), Ok(success_output(&json.to_string()))]);
+
+        let _metadata = snapshot_metadata(&mut host, Some(&root)).unwrap();
+
+        assert_eq!(
+            host.command_calls[1].1,
+            ["metadata", "--format-version", "1", "--all-features", "--locked"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -147,6 +244,7 @@ mod tests {
         let meta = CargoMetadata {
             packages: vec![
                 CargoPackage {
+                    id: "local".to_string(),
                     name: "local".to_string(),
                     version: "0.1.0".to_string(),
                     source: None,
@@ -155,9 +253,10 @@ mod tests {
                     dependencies: vec![],
                 },
                 CargoPackage {
+                    id: "external".to_string(),
                     name: "external".to_string(),
                     version: "1.0.0".to_string(),
-                    source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                    source: None,
                     targets: vec![],
                     manifest_path: PathBuf::from("Cargo.toml"),
                     dependencies: vec![],
@@ -165,6 +264,8 @@ mod tests {
             ],
             workspace_root: PathBuf::from("."),
             target_directory: PathBuf::from("target"),
+            workspace_members: vec!["local".to_string()],
+            resolve: None,
         };
 
         let result = get_workspace_packages(&meta);
