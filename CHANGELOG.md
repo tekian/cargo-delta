@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-22
+
+### Added
+
+- Add `--output PATH` to `snapshot` and `impact`.
+- Add `packages`, `cargo-args-versioned`, `cargo-excludes-versioned`, and
+  `gamma-test-packages` output formats.
+- Add cached, single-invocation impact analysis with `impact --base-ref REF`.
+
+### Changed
+
+- Identify packages as `name@version` in snapshots and package-oriented output.
+- Scope Git-reported `Cargo.lock` changes to packages whose resolved external
+  dependency graphs changed.
+- Scope root `Cargo.toml` changes limited to workspace dependencies, members, or
+  exclusions; other workspace-wide settings remain full-workspace trip wires.
+- Match trip-wire globs by path component so root patterns such as `*.just` do
+  not match nested files.
+
+### Fixed
+
+- Normalize Windows ownership paths so short and long path spellings map to the
+  same package.
+
 ## [0.3.1] - 2026-04-24
 
 ### Added
@@ -54,5 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bump taiki-e/upload-rust-binary-action from 1.27.0 to 1.28.0 (#6)
 
+[0.4.0]: https://github.com/tekian/cargo-delta/compare/v0.3.1...v0.4.0
 [0.3.0]: https://github.com/tekian/cargo-delta/compare/0.2.1...0.3.0
 [0.2.1]: https://github.com/tekian/cargo-delta/compare/0.1...0.2.1
