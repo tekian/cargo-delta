@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6.0.3
       - uses: taiki-e/create-gh-release-action@v1.9.2
         with:
           changelog: CHANGELOG.md
@@ -39,7 +39,7 @@ jobs:
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6.0.3
       - uses: taiki-e/upload-rust-binary-action@v1.28.0
         with:
           bin: cargo-delta
@@ -52,7 +52,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6.0.3
       - uses: rust-lang/crates-io-auth-action@v1.0.3
         id: auth
       - run: cargo publish --locked
