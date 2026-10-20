@@ -179,11 +179,15 @@ baseline snapshot and widens every impact tier to all current packages.
 `-f packages` emits the selected union as sorted `name@version` package IDs,
 one per line. `cargo-args-versioned` and `cargo-excludes-versioned` place those
 IDs after `-p` and `--exclude`; the existing variants continue to emit package
-names. `gamma-test-packages` emits the repeated `--test-package NAME` arguments
-accepted by `cargo gamma run`; cargo-gamma resolves these as workspace package
-names rather than Cargo package specs. `--output` writes whichever format was
-selected to a file instead of stdout. An empty selection produces an empty
-output file.
+names. `pkgids`, `cargo-args-pkgids`, and `cargo-excludes-pkgids` resolve the
+portable snapshot IDs to the opaque package IDs returned by Cargo metadata for
+the current workspace. `pkgids` emits one resolved ID per line, while the other
+formats place them after `-p` or `--exclude`. Those formats are checkout-local
+because path package IDs contain absolute paths. `gamma-test-packages` emits the repeated
+`--test-package NAME` arguments accepted by `cargo gamma run`; cargo-gamma
+resolves these as workspace package names rather than Cargo package specs.
+`--output` writes whichever format was selected to a file instead of stdout.
+An empty selection produces an empty output file.
 
 ## Compatibility
 
