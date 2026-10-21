@@ -351,7 +351,7 @@ fn impact(host: &mut impl Host, config: &config::LoadedConfig, command: &ImpactC
         command.format,
         tiers,
         command.output.as_deref(),
-        Some(&metadata),
+        &metadata,
     ) {
         return;
     }
@@ -386,7 +386,7 @@ fn emit_result(
     tiers: TierMask,
     output: Option<&Path>,
 ) -> bool {
-    emit_result_with_metadata(host, result, workspace, format, tiers, output, None)
+    emit_result_with_metadata(host, result, workspace, format, tiers, output, &cargo::CargoMetadata::default())
 }
 
 fn emit_result_with_metadata(
@@ -396,7 +396,7 @@ fn emit_result_with_metadata(
     format: OutputFormat,
     tiers: TierMask,
     output: Option<&Path>,
-    metadata: Option<&cargo::CargoMetadata>,
+    metadata: &cargo::CargoMetadata,
 ) -> bool {
     let selected = union_of_tiers(result, tiers);
     let text = match format {
@@ -494,12 +494,7 @@ fn emit_result_with_metadata(
     write_output_or_exit(host, output, &text)
 }
 
-fn render_pkgid_args(
-    host: &mut impl Host,
-    packages: &[PackageId],
-    metadata: Option<&cargo::CargoMetadata>,
-    argument: &str,
-) -> Option<String> {
+fn render_pkgid_args(host: &mut impl Host, packages: &[PackageId], metadata: &cargo::CargoMetadata, argument: &str) -> Option<String> {
     let package_ids = resolved_package_ids(host, packages, metadata)?;
     let joined = package_ids
         .into_iter()
@@ -509,15 +504,7 @@ fn render_pkgid_args(
     Some(lines(core::iter::once(joined).filter(|value| !value.is_empty())))
 }
 
-fn resolved_package_ids(host: &mut impl Host, packages: &[PackageId], metadata: Option<&cargo::CargoMetadata>) -> Option<Vec<String>> {
-    let Some(metadata) = metadata else {
-        let _ = writeln!(
-            host.error(),
-            "Error resolving Cargo package IDs: current workspace metadata is unavailable"
-        );
-        host.exit(1);
-        return None;
-    };
+fn resolved_package_ids(host: &mut impl Host, packages: &[PackageId], metadata: &cargo::CargoMetadata) -> Option<Vec<String>> {
     match workspace_package_ids(metadata, packages) {
         Ok(package_ids) => Some(package_ids),
         Err(error) => {
@@ -1377,13 +1364,7 @@ mod tests {
         let render = |format, tiers| {
             let mut host = TestHost::new();
             assert!(emit_result_with_metadata(
-                &mut host,
-                &impact,
-                &workspace,
-                format,
-                tiers,
-                None,
-                Some(&metadata),
+                &mut host, &impact, &workspace, format, tiers, None, &metadata,
             ));
             host.stdout_str()
         };
