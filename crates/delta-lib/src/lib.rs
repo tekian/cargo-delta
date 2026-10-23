@@ -1391,6 +1391,57 @@ mod tests {
     }
 
     #[test]
+    fn pkgid_formats_report_missing_current_workspace_package() {
+        let metadata = make_metadata(&[("a", &[])]);
+        let workspace = sample_workspace();
+        let impact = sample_impact();
+
+        let render = |format| {
+            let mut host = TestHost::new();
+            let ok = emit_result_with_metadata(&mut host, &impact, &workspace, format, all_tiers(), None, &metadata);
+            (ok, host.exit_code, host.stderr_str())
+        };
+
+        assert_eq!(
+            (
+                render(OutputFormat::Pkgids),
+                render(OutputFormat::CargoArgsPkgids),
+                render(OutputFormat::CargoExcludesPkgids),
+            ),
+            (
+                (
+                    false,
+                    Some(1),
+                    "Error resolving Cargo package IDs: current workspace metadata does not contain package 'b@0.1.0'\n".to_string(),
+                ),
+                (
+                    false,
+                    Some(1),
+                    "Error resolving Cargo package IDs: current workspace metadata does not contain package 'b@0.1.0'\n".to_string(),
+                ),
+                (
+                    false,
+                    Some(1),
+                    "Error resolving Cargo package IDs: current workspace metadata does not contain package 'd@0.1.0'\n".to_string(),
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn workspace_package_ids_reject_duplicate_workspace_key() {
+        let mut metadata = make_metadata(&[("a", &[])]);
+        let mut duplicate = metadata.packages[0].clone();
+        duplicate.id = "duplicate-a".to_string();
+        metadata.workspace_members.push(duplicate.id.clone());
+        metadata.packages.push(duplicate);
+
+        let error = workspace_package_ids(&metadata, &[id("a")]).unwrap_err();
+
+        assert_eq!(error, "workspace package 'a@0.1.0' is not unique");
+    }
+
+    #[test]
     fn emit_result_gamma_test_packages_emits_repeated_package_arguments() {
         let mut host = TestHost::new();
 
