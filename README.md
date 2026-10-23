@@ -430,10 +430,18 @@ contain a `cache_key`; older keyless artifacts are rejected as invalid.
 | `names` | One package name per line. |
 | `cargo-args` | One line of `-p NAME` arguments. |
 | `cargo-args-versioned` | One line of `-p NAME@VERSION` arguments. |
+| `cargo-args-pkgids` | One line of `-p PACKAGE_ID` arguments resolved from the current workspace's Cargo metadata. |
 | `cargo-excludes` | One line of `--exclude NAME` arguments for unselected workspace packages. |
 | `cargo-excludes-versioned` | One line of `--exclude NAME@VERSION` arguments for unselected workspace packages. |
+| `cargo-excludes-pkgids` | One line of `--exclude PACKAGE_ID` arguments resolved from the current workspace's Cargo metadata. |
 | `gamma-test-packages` | One line of repeated `--test-package NAME` arguments for `cargo gamma run`. |
 | `packages` | One `name@version` package ID per line. |
+| `pkgids` | One package ID from the current workspace's Cargo metadata per line. |
+
+The `pkgids` and `*-pkgids` formats disambiguate workspace packages from dependencies with
+the same name and version. Cargo metadata IDs for local packages contain the
+absolute checkout path, so these formats are checkout-local: consume them in
+the same workspace invocation and do not persist them for another runner.
 
 Use `--output PATH` to write the same output directly instead of relying on
 shell redirection:

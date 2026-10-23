@@ -9,12 +9,12 @@ use clap::builder::styling::{AnsiColor, Effects};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::MainConfig;
-use crate::crates::{PackageId, Packages, package_name};
+use crate::crates::{PackageId, Packages, package_id, package_name};
 use crate::git::GitDiff;
 use crate::snapshot::{Snapshot, SnapshotContext};
 use crate::snapshot_cache::SnapshotCache;
@@ -121,6 +121,9 @@ enum OutputFormat {
     CargoArgs,
     /// Space-separated `-p NAME@VERSION` arguments.
     CargoArgsVersioned,
+    /// Space-separated `-p PACKAGE_ID` arguments using opaque package IDs from
+    /// the current workspace's Cargo metadata.
+    CargoArgsPkgids,
     /// Space-separated `--exclude NAME` arguments for the *complement* of the selected
     /// tier(s) within the workspace. Use with `cargo --workspace` to scope to impacted
     /// packages without `-p` ambiguity (since `--exclude` matches workspace members only,
@@ -130,10 +133,15 @@ enum OutputFormat {
     CargoExcludes,
     /// Space-separated `--exclude NAME@VERSION` arguments for the workspace complement.
     CargoExcludesVersioned,
+    /// Space-separated `--exclude PACKAGE_ID` arguments using opaque package IDs
+    /// from the current workspace's Cargo metadata.
+    CargoExcludesPkgids,
     /// Space-separated `--test-package NAME` arguments for `cargo gamma run`.
     GammaTestPackages,
     /// One canonical `name@version` package ID per line.
     Packages,
+    /// One opaque package ID from the current workspace's Cargo metadata per line.
+    Pkgids,
 }
 
 /// Bit-mask of which impact tiers to emit. `none()` means "all on" (default).
@@ -223,7 +231,7 @@ fn select_snapshots(
     host: &mut impl Host,
     config: &config::LoadedConfig,
     command: &ImpactCommand,
-) -> error::Result<(Snapshot, Snapshot, git::GitComparison, PathBuf)> {
+) -> error::Result<(Snapshot, Snapshot, git::GitComparison, PathBuf, cargo::CargoMetadata)> {
     let caller_dir = host
         .current_dir()
         .map_err(|error| error::Error::Other(format!("Failed to get current directory: {error}")))?;
@@ -275,7 +283,7 @@ fn select_snapshots(
         }
         None => SnapshotCache::new(host, context).baseline(&comparison.base)?,
     };
-    Ok((baseline, current, comparison, git_root))
+    Ok((baseline, current, comparison, git_root, metadata))
 }
 
 #[doc(hidden)]
@@ -285,7 +293,7 @@ fn impact(host: &mut impl Host, config: &config::LoadedConfig, command: &ImpactC
     let tiers = TierMask::resolve(command.modified, command.affected, command.required);
 
     let _ = writeln!(host.error(), "Looking up git changes..");
-    let (baseline_tree, current_tree, comparison, git_root) = match select_snapshots(host, config, command) {
+    let (baseline_tree, current_tree, comparison, git_root, metadata) = match select_snapshots(host, config, command) {
         Ok(inputs) => inputs,
         Err(error) => {
             let _ = writeln!(host.error(), "Error resolving impact inputs: {error}");
@@ -336,13 +344,14 @@ fn impact(host: &mut impl Host, config: &config::LoadedConfig, command: &ImpactC
         get_impacted_packages(host, &baseline_tree, &current_tree, &diff, &cargo_changes, &config.value)
     };
 
-    if !emit_result(
+    if !emit_result_with_metadata(
         host,
         &result,
         &current_tree.packages,
         command.format,
         tiers,
         command.output.as_deref(),
+        &metadata,
     ) {
         return;
     }
@@ -368,6 +377,7 @@ fn impact(host: &mut impl Host, config: &config::LoadedConfig, command: &ImpactC
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 fn emit_result(
     host: &mut impl Host,
     result: &Impact,
@@ -375,6 +385,18 @@ fn emit_result(
     format: OutputFormat,
     tiers: TierMask,
     output: Option<&Path>,
+) -> bool {
+    emit_result_with_metadata(host, result, workspace, format, tiers, output, &cargo::CargoMetadata::default())
+}
+
+fn emit_result_with_metadata(
+    host: &mut impl Host,
+    result: &Impact,
+    workspace: &Packages,
+    format: OutputFormat,
+    tiers: TierMask,
+    output: Option<&Path>,
+    metadata: &cargo::CargoMetadata,
 ) -> bool {
     let selected = union_of_tiers(result, tiers);
     let text = match format {
@@ -411,6 +433,12 @@ fn emit_result(
                 .join(" ");
             lines(core::iter::once(joined).filter(|value| !value.is_empty()))
         }
+        OutputFormat::CargoArgsPkgids => {
+            let Some(rendered) = render_pkgid_args(host, &selected, metadata, "-p") else {
+                return false;
+            };
+            rendered
+        }
         OutputFormat::CargoExcludes | OutputFormat::CargoExcludesVersioned => {
             let versioned = format == OutputFormat::CargoExcludesVersioned;
             let selected: HashSet<PackageId> = selected.into_iter().collect();
@@ -434,6 +462,19 @@ fn emit_result(
                 .join(" ");
             lines(core::iter::once(joined).filter(|value| !value.is_empty()))
         }
+        OutputFormat::CargoExcludesPkgids => {
+            let selected: HashSet<PackageId> = selected.into_iter().collect();
+            let mut unselected = workspace
+                .get_all_package_ids()
+                .into_iter()
+                .filter(|package| !selected.contains(package))
+                .collect::<Vec<_>>();
+            unselected.sort();
+            let Some(rendered) = render_pkgid_args(host, &unselected, metadata, "--exclude") else {
+                return false;
+            };
+            rendered
+        }
         OutputFormat::GammaTestPackages => {
             let joined = selected
                 .iter()
@@ -443,8 +484,55 @@ fn emit_result(
             lines(core::iter::once(joined).filter(|value| !value.is_empty()))
         }
         OutputFormat::Packages => lines(selected.iter().map(String::as_str)),
+        OutputFormat::Pkgids => {
+            let Some(packages) = resolved_package_ids(host, &selected, metadata) else {
+                return false;
+            };
+            lines(packages)
+        }
     };
     write_output_or_exit(host, output, &text)
+}
+
+fn render_pkgid_args(host: &mut impl Host, packages: &[PackageId], metadata: &cargo::CargoMetadata, argument: &str) -> Option<String> {
+    let package_ids = resolved_package_ids(host, packages, metadata)?;
+    let joined = package_ids
+        .into_iter()
+        .map(|package| format!("{argument} {package}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(lines(core::iter::once(joined).filter(|value| !value.is_empty())))
+}
+
+fn resolved_package_ids(host: &mut impl Host, packages: &[PackageId], metadata: &cargo::CargoMetadata) -> Option<Vec<String>> {
+    match workspace_package_ids(metadata, packages) {
+        Ok(package_ids) => Some(package_ids),
+        Err(error) => {
+            let _ = writeln!(host.error(), "Error resolving Cargo package IDs: {error}");
+            host.exit(1);
+            None
+        }
+    }
+}
+
+fn workspace_package_ids(metadata: &cargo::CargoMetadata, packages: &[PackageId]) -> Result<Vec<String>, String> {
+    let mut package_ids = HashMap::new();
+    for package in cargo::get_workspace_packages(metadata) {
+        let package_key = package_id(&package.name, &package.version);
+        if package_ids.insert(package_key.clone(), package.id.as_str()).is_some() {
+            return Err(format!("workspace package '{package_key}' is not unique"));
+        }
+    }
+
+    packages
+        .iter()
+        .map(|package| {
+            package_ids
+                .get(package)
+                .map(|package_id| (*package_id).to_string())
+                .ok_or_else(|| format!("current workspace metadata does not contain package '{package}'"))
+        })
+        .collect()
 }
 
 fn lines<T: AsRef<str>>(values: impl IntoIterator<Item = T>) -> String {
@@ -624,7 +712,6 @@ pub(crate) mod test_helpers;
 mod tests {
     use super::*;
     use crate::cargo::{CargoDependency, CargoMetadata, CargoPackage, CargoTarget};
-    use crate::crates::package_id;
     use crate::files::{FileKind, FileNode};
     use crate::test_helpers::*;
     use std::fs;
@@ -998,6 +1085,19 @@ mod tests {
         .packages
     }
 
+    fn sample_metadata_with_pkgids() -> CargoMetadata {
+        let mut metadata = make_metadata(&[("a", &[]), ("b", &[]), ("c", &[]), ("d", &[]), ("e", &[])]);
+        for package in &mut metadata.packages {
+            package.id = format!("path+file:///workspace/{}#{}", package.name, package.version);
+        }
+        metadata.workspace_members = metadata.packages.iter().map(|package| package.id.clone()).collect();
+        let mut registry_a = metadata.packages[0].clone();
+        registry_a.id = "registry+https://github.com/rust-lang/crates.io-index#a@0.1.0".to_string();
+        registry_a.source = Some("registry+https://github.com/rust-lang/crates.io-index".to_string());
+        metadata.packages.push(registry_a);
+        metadata
+    }
+
     fn all_tiers() -> TierMask {
         TierMask::resolve(false, false, false)
     }
@@ -1253,6 +1353,92 @@ mod tests {
 
         assert!(ok);
         assert_eq!(host.stdout_str(), "a@0.1.0\nb@0.1.0\nc@0.1.0\n");
+    }
+
+    #[test]
+    fn pkgid_formats_use_current_workspace_member_ids() {
+        let metadata = sample_metadata_with_pkgids();
+        let workspace = sample_workspace();
+        let impact = sample_impact();
+
+        let render = |format, tiers| {
+            let mut host = TestHost::new();
+            assert!(emit_result_with_metadata(
+                &mut host, &impact, &workspace, format, tiers, None, &metadata,
+            ));
+            host.stdout_str()
+        };
+
+        assert_eq!(
+            (
+                render(OutputFormat::Pkgids, all_tiers()),
+                render(OutputFormat::CargoArgsPkgids, all_tiers()),
+                render(OutputFormat::CargoExcludesPkgids, all_tiers()),
+            ),
+            (
+                "path+file:///workspace/a#0.1.0\npath+file:///workspace/b#0.1.0\npath+file:///workspace/c#0.1.0\n".to_string(),
+                "-p path+file:///workspace/a#0.1.0 -p path+file:///workspace/b#0.1.0 -p path+file:///workspace/c#0.1.0\n".to_string(),
+                "--exclude path+file:///workspace/d#0.1.0 --exclude path+file:///workspace/e#0.1.0\n".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn workspace_package_ids_reject_missing_snapshot_package() {
+        let error = workspace_package_ids(&make_metadata(&[("a", &[])]), &[id("b")]).unwrap_err();
+
+        assert_eq!(error, "current workspace metadata does not contain package 'b@0.1.0'");
+    }
+
+    #[test]
+    fn pkgid_formats_report_missing_current_workspace_package() {
+        let metadata = make_metadata(&[("a", &[])]);
+        let workspace = sample_workspace();
+        let impact = sample_impact();
+
+        let render = |format| {
+            let mut host = TestHost::new();
+            let ok = emit_result_with_metadata(&mut host, &impact, &workspace, format, all_tiers(), None, &metadata);
+            (ok, host.exit_code, host.stderr_str())
+        };
+
+        assert_eq!(
+            (
+                render(OutputFormat::Pkgids),
+                render(OutputFormat::CargoArgsPkgids),
+                render(OutputFormat::CargoExcludesPkgids),
+            ),
+            (
+                (
+                    false,
+                    Some(1),
+                    "Error resolving Cargo package IDs: current workspace metadata does not contain package 'b@0.1.0'\n".to_string(),
+                ),
+                (
+                    false,
+                    Some(1),
+                    "Error resolving Cargo package IDs: current workspace metadata does not contain package 'b@0.1.0'\n".to_string(),
+                ),
+                (
+                    false,
+                    Some(1),
+                    "Error resolving Cargo package IDs: current workspace metadata does not contain package 'd@0.1.0'\n".to_string(),
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn workspace_package_ids_reject_duplicate_workspace_key() {
+        let mut metadata = make_metadata(&[("a", &[])]);
+        let mut duplicate = metadata.packages[0].clone();
+        duplicate.id = "duplicate-a".to_string();
+        metadata.workspace_members.push(duplicate.id.clone());
+        metadata.packages.push(duplicate);
+
+        let error = workspace_package_ids(&metadata, &[id("a")]).unwrap_err();
+
+        assert_eq!(error, "workspace package 'a@0.1.0' is not unique");
     }
 
     #[test]

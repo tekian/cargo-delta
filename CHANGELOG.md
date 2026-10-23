@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-22
+
+### Added
+
+- Add `pkgids`, `cargo-args-pkgids`, and `cargo-excludes-pkgids` output formats
+  that resolve portable impact package IDs to the current workspace's Cargo
+  metadata package IDs (#38).
+
 ## [0.4.0] - 2026-09-22
 
 ### Added
@@ -78,6 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bump taiki-e/upload-rust-binary-action from 1.27.0 to 1.28.0 (#6)
 
+[0.5.0]: https://github.com/tekian/cargo-delta/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/tekian/cargo-delta/compare/v0.3.1...v0.4.0
 [0.3.0]: https://github.com/tekian/cargo-delta/compare/0.2.1...0.3.0
 [0.2.1]: https://github.com/tekian/cargo-delta/compare/0.1...0.2.1
